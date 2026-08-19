@@ -89,7 +89,7 @@ class EnergyLabTests(unittest.TestCase):
 
     def test_energy_tariffs_calculate_period_costs(self):
         self.assertAlmostEqual(app.tariff_price_to_eur("grid_import", "32,90"), 0.329)
-        self.assertAlmostEqual(app.tariff_price_to_eur("gas", "0,1090"), 0.109)
+        self.assertAlmostEqual(app.tariff_price_to_eur("gas", "10,90"), 0.109)
         with app.connect() as db:
             db.execute(
                 "INSERT INTO energy_readings(metric,read_on,total_value,delta_value,unit,entity_id) VALUES(?,?,?,?,?,?)",
@@ -111,6 +111,27 @@ class EnergyLabTests(unittest.TestCase):
         self.assertAlmostEqual(costs["grid_import"], 3.29)
         self.assertAlmostEqual(costs["gas"], 2.1)
 
+    def test_base_fee_advances_and_balance(self):
+        self.assertAlmostEqual(app.prorated_months("2025-01-01", "2025-01-31"), 1.0)
+        with app.connect() as db:
+            db.execute(
+                "INSERT INTO energy_readings(metric,read_on,total_value,delta_value,unit,entity_id) VALUES(?,?,?,?,?,?)",
+                ("grid_import", "2025-01-31", 1000, 100, "kWh", "sensor.example_grid"),
+            )
+            db.execute(
+                """INSERT INTO energy_tariffs(
+                       metric,provider,valid_from,valid_to,price_per_kwh,kwh_per_unit,
+                       base_fee_monthly,advance_monthly
+                   ) VALUES(?,?,?,?,?,?,?,?)""",
+                ("grid_import", "Beispiel", "2025-01-01", "2025-01-31", 0.329, 1.0, 12.0, 100.0),
+            )
+            values = app.energy_finances(db)["grid_import"]
+        self.assertAlmostEqual(values["variable"], 32.9)
+        self.assertAlmostEqual(values["base_fee"], 12.0)
+        self.assertAlmostEqual(values["cost"], 44.9)
+        self.assertAlmostEqual(values["advance"], 100.0)
+        self.assertAlmostEqual(values["balance"], 55.1)
+
     def test_existing_tariffs_gain_provider_column(self):
         with app.connect() as db:
             db.execute("DROP TABLE energy_tariffs")
@@ -131,8 +152,27 @@ class EnergyLabTests(unittest.TestCase):
             )
         app.init_db()
         with app.connect() as db:
-            row = db.execute("SELECT provider FROM energy_tariffs").fetchone()
+            row = db.execute("SELECT provider,base_fee_monthly,advance_monthly FROM energy_tariffs").fetchone()
         self.assertEqual(row["provider"], "")
+        self.assertEqual(row["base_fee_monthly"], 0)
+        self.assertEqual(row["advance_monthly"], 0)
+
+    def test_legacy_cent_prices_are_corrected_once(self):
+        with app.connect() as db:
+            db.execute(
+                "INSERT INTO energy_tariffs(metric,provider,valid_from,valid_to,price_per_kwh,kwh_per_unit) VALUES(?,?,?,?,?,?)",
+                ("grid_import", "Altstrom", "2024-01-01", "2024-12-31", 32.9, 1.0),
+            )
+            db.execute(
+                "INSERT INTO energy_tariffs(metric,provider,valid_from,valid_to,price_per_kwh,kwh_per_unit) VALUES(?,?,?,?,?,?)",
+                ("gas", "Altgas", "2024-01-01", "2024-12-31", 10.9, 10.5),
+            )
+        app.init_db()
+        app.init_db()
+        with app.connect() as db:
+            prices = {row["metric"]: row["price_per_kwh"] for row in db.execute("SELECT metric,price_per_kwh FROM energy_tariffs")}
+        self.assertAlmostEqual(prices["grid_import"], 0.329)
+        self.assertAlmostEqual(prices["gas"], 0.109)
 
 
 if __name__ == "__main__":
