@@ -32,7 +32,7 @@ from socketserver import ThreadingMixIn
 
 
 APP_NAME = "EnergieLab"
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.3.1"
 DATA_DIR = Path(os.getenv("ENERGYLAB_DATA_DIR", "/data"))
 DB_PATH = DATA_DIR / "energylab.sqlite3"
 HOST = os.getenv("ENERGYLAB_HOST", "0.0.0.0")
@@ -43,6 +43,13 @@ HA_TOKEN = os.getenv("HA_TOKEN", "").strip()
 COFFEE_URL = os.getenv("BUY_ME_A_COFFEE_URL", "").strip()
 MAX_UPLOAD = 5 * 1024 * 1024
 TARIFF_LIMIT = 5
+
+# Generous household safety limits. Gaps are multiplied by their day count.
+MAX_DAILY_CHANGE = {
+    "grid_import": float(os.getenv("ENERGYLAB_MAX_GRID_KWH_DAY", "250")),
+    "pv_self": float(os.getenv("ENERGYLAB_MAX_PV_KWH_DAY", "250")),
+    "gas": float(os.getenv("ENERGYLAB_MAX_GAS_M3_DAY", "100")),
+}
 
 METRICS = {
     "grid_import": {
@@ -172,12 +179,14 @@ def init_db() -> None:
                 unit TEXT NOT NULL,
                 entity_id TEXT NOT NULL,
                 source TEXT NOT NULL DEFAULT 'home_assistant',
+                is_valid INTEGER NOT NULL DEFAULT 1,
+                invalid_reason TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(metric, read_on)
             );
             CREATE TABLE IF NOT EXISTS energy_tariffs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                metric TEXT NOT NULL CHECK(metric IN ('grid_import','gas')),
+                metric TEXT NOT NULL CHECK(metric IN ('grid_import','gas','water')),
                 provider TEXT NOT NULL DEFAULT '',
                 valid_from TEXT NOT NULL,
                 valid_to TEXT,
@@ -205,9 +214,18 @@ def init_db() -> None:
             db.execute("ALTER TABLE energy_tariffs ADD COLUMN base_fee_monthly REAL NOT NULL DEFAULT 0")
         if "advance_monthly" not in tariff_columns:
             db.execute("ALTER TABLE energy_tariffs ADD COLUMN advance_monthly REAL NOT NULL DEFAULT 0")
+        upgrade_tariff_table_for_water(db)
+        reading_columns = {row["name"] for row in db.execute("PRAGMA table_info(energy_readings)")}
+        if "is_valid" not in reading_columns:
+            db.execute("ALTER TABLE energy_readings ADD COLUMN is_valid INTEGER NOT NULL DEFAULT 1")
+        if "invalid_reason" not in reading_columns:
+            db.execute("ALTER TABLE energy_readings ADD COLUMN invalid_reason TEXT NOT NULL DEFAULT ''")
         # Older forms were labelled €/kWh although users naturally entered cents.
         # Values above 5 €/kWh are unambiguously cent values and are corrected once.
-        db.execute("UPDATE energy_tariffs SET price_per_kwh=price_per_kwh/100.0 WHERE price_per_kwh>5.0")
+        db.execute("""UPDATE energy_tariffs SET price_per_kwh=price_per_kwh/100.0
+                      WHERE metric IN ('grid_import','gas') AND price_per_kwh>5.0""")
+        for metric in MAX_DAILY_CHANGE:
+            sanitize_cumulative_readings(db, metric)
         db.execute("INSERT OR IGNORE INTO meta(key,value) VALUES('session_secret',?)", (secrets.token_hex(32),))
         if not db.execute("SELECT 1 FROM vehicles LIMIT 1").fetchone():
             cur = db.execute("INSERT INTO vehicles(name) VALUES(?)", ("VW T6.1",))
@@ -260,6 +278,95 @@ def period_bounds(period: str):
     return date(today.year, today.month, 1).isoformat(), None
 
 
+def upgrade_tariff_table_for_water(db) -> None:
+    schema_row = db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='energy_tariffs'"
+    ).fetchone()
+    if schema_row and "'water'" in (schema_row["sql"] or ""):
+        return
+    db.execute("ALTER TABLE energy_tariffs RENAME TO energy_tariffs_before_water")
+    db.execute(
+        """CREATE TABLE energy_tariffs (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               metric TEXT NOT NULL CHECK(metric IN ('grid_import','gas','water')),
+               provider TEXT NOT NULL DEFAULT '',
+               valid_from TEXT NOT NULL,
+               valid_to TEXT,
+               price_per_kwh REAL NOT NULL CHECK(price_per_kwh >= 0),
+               kwh_per_unit REAL NOT NULL CHECK(kwh_per_unit > 0),
+               base_fee_monthly REAL NOT NULL DEFAULT 0 CHECK(base_fee_monthly >= 0),
+               advance_monthly REAL NOT NULL DEFAULT 0 CHECK(advance_monthly >= 0),
+               created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+               CHECK(valid_to IS NULL OR valid_to >= valid_from)
+           )"""
+    )
+    db.execute(
+        """INSERT INTO energy_tariffs(
+               id,metric,provider,valid_from,valid_to,price_per_kwh,kwh_per_unit,
+               base_fee_monthly,advance_monthly,created_at
+           )
+           SELECT id,metric,provider,valid_from,valid_to,price_per_kwh,kwh_per_unit,
+                  base_fee_monthly,advance_monthly,created_at
+           FROM energy_tariffs_before_water"""
+    )
+    db.execute("DROP TABLE energy_tariffs_before_water")
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_energy_tariffs_period ON energy_tariffs(metric,valid_from,valid_to)"
+    )
+
+
+def sanitize_cumulative_readings(db, metric: str) -> int:
+    """Rebuild deltas from accepted meter totals and flag outages/outliers."""
+    if metric not in MAX_DAILY_CHANGE:
+        return 0
+    rows = db.execute(
+        "SELECT id,read_on,total_value FROM energy_readings WHERE metric=? ORDER BY read_on,id",
+        (metric,),
+    ).fetchall()
+    previous_total = None
+    previous_day = None
+    rejected = 0
+    for row in rows:
+        current_day = date.fromisoformat(row["read_on"])
+        try:
+            current_total = float(row["total_value"])
+        except (TypeError, ValueError):
+            current_total = math.nan
+        valid = True
+        reason = ""
+        delta = None
+        if not math.isfinite(current_total) or current_total < 0:
+            valid = False
+            reason = "Ungültiger Zählerstand"
+        elif previous_total is None:
+            if current_total == 0:
+                valid = False
+                reason = "Nullwert ohne gültige Basis"
+        elif current_total == 0:
+            valid = False
+            reason = "Nullwert während Sensorausfall"
+        elif current_total < previous_total:
+            valid = False
+            reason = "Zählerstand ist zurückgesprungen"
+        else:
+            elapsed_days = max(1, (current_day - previous_day).days)
+            delta = current_total - previous_total
+            if delta > MAX_DAILY_CHANGE[metric] * elapsed_days:
+                valid = False
+                reason = "Unplausibel großer Zählersprung"
+                delta = None
+        if valid:
+            previous_total = current_total
+            previous_day = current_day
+        else:
+            rejected += 1
+        db.execute(
+            "UPDATE energy_readings SET delta_value=?,is_valid=?,invalid_reason=? WHERE id=?",
+            (delta, 1 if valid else 0, reason, row["id"]),
+        )
+    return rejected
+
+
 def prorated_months(start_on: str, end_on: str) -> float:
     """Return inclusive calendar-month fractions for period-based amounts."""
     start = date.fromisoformat(start_on)
@@ -291,7 +398,7 @@ def energy_finances(db, start_on=None):
             JOIN energy_tariffs t ON t.metric=e.metric
              AND e.read_on>=t.valid_from
              AND (t.valid_to IS NULL OR e.read_on<=t.valid_to)
-            WHERE e.delta_value IS NOT NULL {where}
+            WHERE e.delta_value IS NOT NULL AND e.is_valid=1 {where}
             GROUP BY e.metric""",
         args,
     ).fetchall()
@@ -307,7 +414,7 @@ def energy_finances(db, start_on=None):
     }
     latest = {
         row["metric"]: row["latest_on"]
-        for row in db.execute("SELECT metric,MAX(read_on) latest_on FROM energy_readings GROUP BY metric")
+        for row in db.execute("SELECT metric,MAX(read_on) latest_on FROM energy_readings WHERE is_valid=1 GROUP BY metric")
     }
     for tariff in db.execute("SELECT * FROM energy_tariffs ORDER BY valid_from,id"):
         metric = tariff["metric"]
@@ -338,7 +445,7 @@ def pv_savings(db, start_on=None):
             JOIN energy_tariffs t ON t.metric='grid_import'
              AND e.read_on>=t.valid_from
              AND (t.valid_to IS NULL OR e.read_on<=t.valid_to)
-            WHERE e.metric='pv_self' AND e.delta_value IS NOT NULL {where}""",
+            WHERE e.metric='pv_self' AND e.delta_value IS NOT NULL AND e.is_valid=1 {where}""",
         args,
     ).fetchone()
     return row["savings"] if row and row["savings"] is not None else None
@@ -351,11 +458,11 @@ def save_manual_water_reading(read_on, total_value):
         raise ValueError("Bitte ein gültiges Datum bis heute und einen nichtnegativen Wasserzählerstand eingeben.")
     with connect() as db:
         db.execute(
-            """INSERT INTO energy_readings(metric,read_on,total_value,delta_value,unit,entity_id,source)
-               VALUES('water',?,?,NULL,'m³','manual','manual')
+            """INSERT INTO energy_readings(metric,read_on,total_value,delta_value,unit,entity_id,source,is_valid,invalid_reason)
+               VALUES('water',?,?,NULL,'m³','manual','manual',1,'')
                ON CONFLICT(metric,read_on) DO UPDATE SET
                  total_value=excluded.total_value,source='manual',entity_id='manual',
-                 unit='m³',created_at=CURRENT_TIMESTAMP""",
+                 unit='m³',is_valid=1,invalid_reason='',created_at=CURRENT_TIMESTAMP""",
             (read_on, total_value),
         )
         rows = db.execute(
@@ -373,7 +480,7 @@ def save_manual_water_reading(read_on, total_value):
 
 
 def tariff_price_to_eur(metric: str, value):
-    """Normalize UI prices; tariffs are entered in cents, DB and costs use euros."""
+    """Normalize energy UI prices; water is already entered in euros per m³."""
     price = parse_num(value)
     if price is None:
         return None
@@ -387,10 +494,10 @@ def parse_energy_tariff(form):
     valid_to_raw = str(form.get("valid_to", "")).strip()
     valid_to = parse_iso_date(valid_to_raw) if valid_to_raw else None
     price = tariff_price_to_eur(metric, form.get("price_per_kwh"))
-    factor = 1.0 if metric == "grid_import" else parse_num(form.get("kwh_per_unit"))
+    factor = 1.0 if metric in ("grid_import", "water") else parse_num(form.get("kwh_per_unit"))
     base_fee = parse_num(form.get("base_fee_monthly"))
     advance = parse_num(form.get("advance_monthly"))
-    if metric not in ("grid_import", "gas") or not provider or len(provider) > 100 or not valid_from or (valid_to_raw and not valid_to):
+    if metric not in ("grid_import", "gas", "water") or not provider or len(provider) > 100 or not valid_from or (valid_to_raw and not valid_to):
         raise ValueError("Bitte Anbieter, Messgröße und gültigen Datumsbereich prüfen.")
     if valid_to and valid_to < valid_from:
         raise ValueError("Das Enddatum darf nicht vor dem Startdatum liegen.")
@@ -709,17 +816,19 @@ def import_statistics_rows(result, metrics=None):
                 if delta is not None and delta < 0:
                     delta = None
                 db.execute(
-                    """INSERT INTO energy_readings(metric,read_on,total_value,delta_value,unit,entity_id,source)
-                       VALUES(?,?,?,?,?,?,?)
+                    """INSERT INTO energy_readings(metric,read_on,total_value,delta_value,unit,entity_id,source,is_valid,invalid_reason)
+                       VALUES(?,?,?,?,?,?,?,1,'')
                        ON CONFLICT(metric,read_on) DO UPDATE SET
                          total_value=excluded.total_value,
                          delta_value=COALESCE(excluded.delta_value,energy_readings.delta_value),
                          unit=excluded.unit,entity_id=excluded.entity_id,source=excluded.source,
+                         is_valid=1,invalid_reason='',
                          created_at=CURRENT_TIMESTAMP""",
                     (metric, read_on, total, delta, cfg["unit"], entity, "home_assistant_history"),
                 )
                 previous_total = total
                 count += 1
+            sanitize_cumulative_readings(db, metric)
             counts[metric] = count
     return counts
 
@@ -767,7 +876,7 @@ def sync_home_assistant():
                 continue
             unit = state.get("attributes", {}).get("unit_of_measurement") or cfg["unit"]
             previous = db.execute(
-                "SELECT total_value FROM energy_readings WHERE metric=? AND read_on<? ORDER BY read_on DESC LIMIT 1",
+                "SELECT total_value FROM energy_readings WHERE metric=? AND read_on<? AND is_valid=1 ORDER BY read_on DESC LIMIT 1",
                 (metric, today),
             ).fetchone()
             delta = None
@@ -775,14 +884,16 @@ def sync_home_assistant():
                 candidate = value - previous["total_value"]
                 delta = candidate if candidate >= 0 else None
             db.execute(
-                """INSERT INTO energy_readings(metric,read_on,total_value,delta_value,unit,entity_id)
-                   VALUES(?,?,?,?,?,?)
+                """INSERT INTO energy_readings(metric,read_on,total_value,delta_value,unit,entity_id,is_valid,invalid_reason)
+                   VALUES(?,?,?,?,?,?,1,'')
                    ON CONFLICT(metric,read_on) DO UPDATE SET
                      total_value=excluded.total_value,
                      delta_value=excluded.delta_value,
-                     unit=excluded.unit,entity_id=excluded.entity_id,created_at=CURRENT_TIMESTAMP""",
+                     unit=excluded.unit,entity_id=excluded.entity_id,
+                     is_valid=1,invalid_reason='',created_at=CURRENT_TIMESTAMP""",
                 (metric, today, value, delta, unit, entity),
             )
+            sanitize_cumulative_readings(db, metric)
             messages.append(f"{cfg['label']}: {fmt_num(value)} {unit}")
         status = "ok" if messages and not any("Fehler" in m for m in messages) else "warning"
         db.execute("INSERT INTO sync_log(status,message) VALUES(?,?)", (status, "; ".join(messages) or "Keine Sensoren konfiguriert"))
@@ -837,7 +948,7 @@ def page(title, body, active="", notice="", warning=False):
 
 def sparkline(db, metric, days=30):
     rows = db.execute(
-        "SELECT delta_value FROM energy_readings WHERE metric=? AND delta_value IS NOT NULL ORDER BY read_on DESC LIMIT ?",
+        "SELECT delta_value FROM energy_readings WHERE metric=? AND delta_value IS NOT NULL AND is_valid=1 ORDER BY read_on DESC LIMIT ?",
         (metric, days),
     ).fetchall()[::-1]
     values = [r["delta_value"] for r in rows]
@@ -1002,7 +1113,7 @@ class Handler(BaseHTTPRequestHandler):
     def dashboard(self, period, notice):
         period = period if period in ("month", "year", "all") else "month"
         start, _ = period_bounds(period)
-        where = "WHERE read_on>=?" if start else ""
+        where = "WHERE is_valid=1 AND read_on>=?" if start else "WHERE is_valid=1"
         args = (start,) if start else ()
         with connect() as db:
             energy = {r["metric"]: r["value"] for r in db.execute(f"SELECT metric,SUM(delta_value) value FROM energy_readings {where} GROUP BY metric", args)}
@@ -1025,7 +1136,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.metric_card("⚡", "Strombezug", energy.get("grid_import"), "kWh", f'<div class="muted">Kosten: {fmt_money(costs.get("grid_import"))}</div>' + sparkline(db, "grid_import")),
                     self.metric_card("☀️", "PV-Eigenverbrauch", energy.get("pv_self"), "kWh", f'<div class="muted">Dadurch gespart: {pv_saved_text}</div>' + sparkline(db, "pv_self")),
                     self.metric_card("🔥", "Gas", energy.get("gas"), "m³", f'<div class="muted">Kosten: {fmt_money(costs.get("gas"))}</div>' + sparkline(db, "gas")),
-                    self.metric_card("💧", "Wasser", energy.get("water"), "m³", sparkline(db, "water")),
+                    self.metric_card("💧", "Wasser", energy.get("water"), "m³", f'<div class="muted">Kosten: {fmt_money(costs.get("water"))}</div>' + sparkline(db, "water")),
                     self.metric_card("🚐", "T6.1 Ø-Verbrauch", diesel_avg, "l/100 km", ""),
                 ]
             )
@@ -1046,17 +1157,22 @@ class Handler(BaseHTTPRequestHandler):
     def energy_page(self, notice):
         token = self.cookie_token()
         with connect() as db:
-            latest = {r["metric"]: r for r in db.execute("SELECT e.* FROM energy_readings e JOIN (SELECT metric,MAX(read_on) d FROM energy_readings GROUP BY metric) x ON x.metric=e.metric AND x.d=e.read_on")}
+            latest = {r["metric"]: r for r in db.execute("SELECT e.* FROM energy_readings e JOIN (SELECT metric,MAX(read_on) d FROM energy_readings WHERE is_valid=1 GROUP BY metric) x ON x.metric=e.metric AND x.d=e.read_on WHERE e.is_valid=1")}
             logs = db.execute("SELECT * FROM sync_log ORDER BY id DESC LIMIT 12").fetchall()
             tariffs = db.execute("SELECT * FROM energy_tariffs ORDER BY valid_from DESC,id DESC").fetchall()
             finances = energy_finances(db)
             pv_saved = pv_savings(db)
             water_readings = db.execute(
-                "SELECT * FROM energy_readings WHERE metric='water' ORDER BY read_on DESC,id DESC LIMIT 12"
+                "SELECT * FROM energy_readings WHERE metric='water' AND is_valid=1 ORDER BY read_on DESC,id DESC LIMIT 12"
             ).fetchall()
+            invalid_counts = {
+                row["metric"]: row["count"]
+                for row in db.execute("SELECT metric,COUNT(*) count FROM energy_readings WHERE is_valid=0 GROUP BY metric")
+            }
         tariff_counts = {
             "grid_import": sum(1 for tariff in tariffs if tariff["metric"] == "grid_import"),
             "gas": sum(1 for tariff in tariffs if tariff["metric"] == "gas"),
+            "water": sum(1 for tariff in tariffs if tariff["metric"] == "water"),
         }
         rows = ""
         for key, cfg in METRICS.items():
@@ -1075,7 +1191,7 @@ class Handler(BaseHTTPRequestHandler):
                 balance_html = "–"
             entity_label = "manuelle Eingabe" if key == "water" else (cfg["entity"] or "nicht eingerichtet")
             saving_html = f'<strong>−{fmt_money(pv_saved)}</strong><br><span class="badge ok">dadurch gespart</span>' if key == "pv_self" and pv_saved is not None else "–"
-            rows += f"<tr><td>{cfg['icon']} <strong>{esc(cfg['label'])}</strong></td><td>{esc(entity_label)}</td><td>{fmt_num(value['total_value'])+' '+esc(value['unit']) if value else '–'}</td><td>{esc(value['read_on']) if value else '–'}</td><td>{variable}</td><td>{base_fee}</td><td><strong>{cost}</strong></td><td>{advance}</td><td>{balance_html if key in ('grid_import', 'gas') else '–'}</td><td>{saving_html}</td></tr>"
+            rows += f"<tr><td>{cfg['icon']} <strong>{esc(cfg['label'])}</strong></td><td>{esc(entity_label)}</td><td>{fmt_num(value['total_value'])+' '+esc(value['unit']) if value else '–'}</td><td>{esc(value['read_on']) if value else '–'}</td><td>{variable}</td><td>{base_fee}</td><td><strong>{cost}</strong></td><td>{advance}</td><td>{balance_html if key in ('grid_import', 'gas', 'water') else '–'}</td><td>{saving_html}</td></tr>"
         logrows = "".join(f"<tr><td>{esc(r['synced_at'])}</td><td><span class=\"badge {'ok' if r['status']=='ok' else 'warn'}\">{esc(r['status'])}</span></td><td>{esc(r['message'])}</td></tr>" for r in logs)
         waterrows = "".join(
             f"<tr><td>{esc(r['read_on'])}</td><td>{fmt_num(r['total_value'])} m³</td><td>{fmt_num(r['delta_value']) + ' m³' if r['delta_value'] is not None else 'Erster Stand'}</td></tr>"
@@ -1083,20 +1199,29 @@ class Handler(BaseHTTPRequestHandler):
         )
         tariffrows = ""
         for tariff in tariffs:
-            label = "Strombezug" if tariff["metric"] == "grid_import" else "Gas"
-            factor = "1,000 kWh/kWh" if tariff["metric"] == "grid_import" else f"{fmt_num(tariff['kwh_per_unit'], 4)} kWh/m³"
-            price = f"{fmt_num(tariff['price_per_kwh'] * 100, 2)} Cent/kWh"
+            if tariff["metric"] == "grid_import":
+                label, factor = "Strombezug", "1,000 kWh/kWh"
+                price = f"{fmt_num(tariff['price_per_kwh'] * 100, 2)} Cent/kWh"
+            elif tariff["metric"] == "gas":
+                label, factor = "Gas", f"{fmt_num(tariff['kwh_per_unit'], 4)} kWh/m³"
+                price = f"{fmt_num(tariff['price_per_kwh'] * 100, 2)} Cent/kWh"
+            else:
+                label, factor = "Wasser", "–"
+                price = f"{fmt_num(tariff['price_per_kwh'], 4)} €/m³"
             tariffrows += f"""<tr><td><strong>{label}</strong></td><td>{esc(tariff['provider'] or '–')}</td><td>{esc(tariff['valid_from'])}</td><td>{esc(tariff['valid_to'] or 'offen')}</td><td>{price}</td><td>{factor}</td><td>{fmt_money(tariff['base_fee_monthly'])}/Monat</td><td>{fmt_money(tariff['advance_monthly'])}/Monat</td><td><div class="actions"><a href="/energy/tariffs/{tariff['id']}/edit">Bearbeiten</a><form method="post" action="/energy/tariffs/{tariff['id']}/delete" onsubmit="return confirm('Tarifzeitraum wirklich löschen?')"><input type="hidden" name="csrf" value="{csrf_for(token)}"><button style="border:0;background:none;color:#ff8e98;cursor:pointer">Löschen</button></form></div></td></tr>"""
+        anomaly_items = [f"{METRICS[key]['label']}: {count}" for key, count in invalid_counts.items() if key in METRICS]
+        anomaly_html = f'<div class="notice warn">Automatische Plausibilitätsprüfung: {esc(", ".join(anomaly_items))} unplausible Werte werden nicht mitgerechnet.</div>' if anomaly_items else ""
         readiness = '<span class="good-dot"></span> eingerichtet' if ha_ready() else '<span class="warning-dot"></span> Token/URL noch eintragen'
         default_start = date(date.today().year, 1, 1).isoformat()
         csrf = csrf_for(token)
-        body = f"""<div class="topbar"><div><h1>Energie</h1><div class="subtitle">Tägliche Zählerstände aus Home Assistant · {readiness}</div></div><form method="post" action="/energy/sync"><input type="hidden" name="csrf" value="{csrf}"><button class="btn">Jetzt synchronisieren</button></form></div>
+        body = f"""<div class="topbar"><div><h1>Energie</h1><div class="subtitle">Tägliche Zählerstände aus Home Assistant · {readiness}</div></div><form method="post" action="/energy/sync"><input type="hidden" name="csrf" value="{csrf}"><button class="btn">Jetzt synchronisieren</button></form></div>{anomaly_html}
         <div class="card"><div class="table-wrap"><table><thead><tr><th>Messgröße</th><th>Datenquelle</th><th>Letzter Stand</th><th>Datum</th><th>Verbrauchskosten</th><th>Grundpreis</th><th>Gesamtkosten</th><th>Abschläge</th><th>Prognose</th><th>PV-Ersparnis</th></tr></thead><tbody>{rows}</tbody></table></div><p class="muted" style="padding:0 28px 22px">Verbrauchskosten + Grundpreis = Gesamtkosten. Die PV-Ersparnis wird separat mit dem gültigen Strom-Arbeitspreis berechnet und reduziert diese Kosten nicht.</p></div>
         <section class="section card"><div class="section-head"><h2>Wasserzähler manuell erfassen</h2><span class="badge">nur manuell</span></div><div class="two"><form method="post" action="/energy/water/save"><input type="hidden" name="csrf" value="{csrf}"><div class="form-grid"><div class="field"><label>Ablesedatum</label><input type="date" name="read_on" value="{date.today().isoformat()}" max="{date.today().isoformat()}" required></div><div class="field"><label>Zählerstand in m³</label><input inputmode="decimal" name="total_value" placeholder="z. B. 123,456" required></div></div><p class="muted">Eine erneute Eingabe für dasselbe Datum korrigiert den vorhandenen Stand. Die Verbräuche zwischen allen Ablesungen werden danach neu berechnet.</p><button class="btn" style="margin-top:8px">Wasserstand speichern</button></form><div class="table-wrap"><table><thead><tr><th>Datum</th><th>Zählerstand</th><th>Verbrauch seit davor</th></tr></thead><tbody>{waterrows or '<tr><td colspan="3" class="empty">Noch keine Wasserstände erfasst</td></tr>'}</tbody></table></div></div></section>
         <section class="section two"><div class="card"><div class="section-head"><h2>Historie einmalig importieren</h2></div><p class="muted">Übernimmt vorhandene tägliche Langzeitstatistiken aus Home Assistant. Ein erneuter Lauf aktualisiert dieselben Tage und erzeugt keine Duplikate.</p><form method="post" action="/energy/backfill"><input type="hidden" name="csrf" value="{csrf}"><div class="field"><label>Historie ab</label><input type="date" name="start_date" value="{default_start}" max="{date.today().isoformat()}" required></div><button class="btn" style="margin-top:18px">Historie importieren</button></form></div>
         <div class="card"><div class="section-head"><h2>Stromtarif hinzufügen</h2><span class="badge">{tariff_counts['grid_import']} von {TARIFF_LIMIT}</span></div><form method="post" action="/energy/tariffs/save"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="metric" value="grid_import"><div class="form-grid"><div class="field full"><label>Anbieter</label><input name="provider" maxlength="100" placeholder="z. B. Stadtwerke Musterstadt" required></div><div class="field"><label>Gültig von</label><input type="date" name="valid_from" required></div><div class="field"><label>Gültig bis</label><input type="date" name="valid_to"></div><div class="field"><label>Strompreis in Cent/kWh</label><input inputmode="decimal" name="price_per_kwh" placeholder="z. B. 32,90" required></div><div class="field"><label>Grundpreis in €/Monat</label><input inputmode="decimal" name="base_fee_monthly" placeholder="z. B. 12,50" required></div><div class="field full"><label>Abschlag in €/Monat</label><input inputmode="decimal" name="advance_monthly" placeholder="z. B. 95,00" required></div></div><button class="btn" style="margin-top:18px" {'disabled' if tariff_counts['grid_import'] >= TARIFF_LIMIT else ''}>Stromtarif speichern</button>{'<p class="muted">Das Limit von fünf Stromtarifen ist erreicht. Lösche bei Bedarf einen alten Zeitraum.</p>' if tariff_counts['grid_import'] >= TARIFF_LIMIT else ''}</form></div></section>
         <section class="section card"><div class="section-head"><h2>Gastarif hinzufügen</h2><span class="badge">{tariff_counts['gas']} von {TARIFF_LIMIT}</span></div><form method="post" action="/energy/tariffs/save"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="metric" value="gas"><div class="form-grid"><div class="field full"><label>Anbieter</label><input name="provider" maxlength="100" placeholder="z. B. Stadtwerke Musterstadt" required></div><div class="field"><label>Gültig von</label><input type="date" name="valid_from" required></div><div class="field"><label>Gültig bis</label><input type="date" name="valid_to"></div><div class="field"><label>Gaspreis in Cent/kWh</label><input inputmode="decimal" name="price_per_kwh" placeholder="z. B. 10,90" required></div><div class="field"><label>Umrechnung kWh pro m³</label><input inputmode="decimal" name="kwh_per_unit" placeholder="laut Gasabrechnung, z. B. 10,42" required></div><div class="field"><label>Grundpreis in €/Monat</label><input inputmode="decimal" name="base_fee_monthly" placeholder="z. B. 14,00" required></div><div class="field"><label>Abschlag in €/Monat</label><input inputmode="decimal" name="advance_monthly" placeholder="z. B. 120,00" required></div></div><p class="muted">Der Gaszähler liefert m³. Den periodenbezogenen Umrechnungsfaktor findest du auf der Gasabrechnung.</p><button class="btn" style="margin-top:8px" {'disabled' if tariff_counts['gas'] >= TARIFF_LIMIT else ''}>Gastarif speichern</button>{'<p class="muted">Das Limit von fünf Gastarifen ist erreicht. Lösche bei Bedarf einen alten Zeitraum.</p>' if tariff_counts['gas'] >= TARIFF_LIMIT else ''}</form></section>
-        <details class="section tariff-history"><summary><span>Gespeicherte Tarife anzeigen</span><span class="badge">Strom {tariff_counts['grid_import']}/{TARIFF_LIMIT} · Gas {tariff_counts['gas']}/{TARIFF_LIMIT}</span></summary><div class="details-body"><div class="table-wrap"><table><thead><tr><th>Messgröße</th><th>Anbieter</th><th>Von</th><th>Bis</th><th>Preis</th><th>Umrechnung</th><th>Grundpreis</th><th>Abschlag</th><th></th></tr></thead><tbody>{tariffrows or '<tr><td colspan="9" class="empty">Noch keine Tarife hinterlegt</td></tr>'}</tbody></table></div></div></details>
+        <section class="section card"><div class="section-head"><h2>Wassertarif hinzufügen</h2><span class="badge">{tariff_counts['water']} von {TARIFF_LIMIT}</span></div><form method="post" action="/energy/tariffs/save"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="metric" value="water"><div class="form-grid"><div class="field full"><label>Anbieter</label><input name="provider" maxlength="100" placeholder="z. B. Wasserverband Musterstadt" required></div><div class="field"><label>Gültig von</label><input type="date" name="valid_from" required></div><div class="field"><label>Gültig bis</label><input type="date" name="valid_to"></div><div class="field"><label>Verbrauchspreis in €/m³</label><input inputmode="decimal" name="price_per_kwh" placeholder="z. B. 4,2500" required></div><div class="field"><label>Grundpreis in €/Monat</label><input inputmode="decimal" name="base_fee_monthly" placeholder="z. B. 8,50" required></div><div class="field full"><label>Abschlag in €/Monat</label><input inputmode="decimal" name="advance_monthly" placeholder="z. B. 45,00" required></div></div><p class="muted">Für vollständige variable Kosten kannst du Trinkwasser und Abwasser im Verbrauchspreis zusammenfassen.</p><button class="btn" style="margin-top:8px" {'disabled' if tariff_counts['water'] >= TARIFF_LIMIT else ''}>Wassertarif speichern</button>{'<p class="muted">Das Limit von fünf Wassertarifen ist erreicht. Lösche bei Bedarf einen alten Zeitraum.</p>' if tariff_counts['water'] >= TARIFF_LIMIT else ''}</form></section>
+        <details class="section tariff-history"><summary><span>Gespeicherte Tarife anzeigen</span><span class="badge">Strom {tariff_counts['grid_import']}/{TARIFF_LIMIT} · Gas {tariff_counts['gas']}/{TARIFF_LIMIT} · Wasser {tariff_counts['water']}/{TARIFF_LIMIT}</span></summary><div class="details-body"><div class="table-wrap"><table><thead><tr><th>Messgröße</th><th>Anbieter</th><th>Von</th><th>Bis</th><th>Preis</th><th>Umrechnung</th><th>Grundpreis</th><th>Abschlag</th><th></th></tr></thead><tbody>{tariffrows or '<tr><td colspan="9" class="empty">Noch keine Tarife hinterlegt</td></tr>'}</tbody></table></div></div></details>
         <section class="section card"><div class="section-head"><h2>Importprotokoll</h2></div><div class="table-wrap"><table><thead><tr><th>Zeit</th><th>Status</th><th>Meldung</th></tr></thead><tbody>{logrows or '<tr><td colspan="3" class="empty">Noch keine Synchronisierung</td></tr>'}</tbody></table></div></section>"""
         self.send_html(page("Energie", body, "/energy", notice, "Fehler" in notice))
 
@@ -1106,7 +1231,7 @@ class Handler(BaseHTTPRequestHandler):
         with connect() as db:
             count = db.execute("SELECT COUNT(*) c FROM energy_tariffs WHERE metric=?", (values["metric"],)).fetchone()["c"]
             if count >= TARIFF_LIMIT:
-                label = "Stromtarife" if values["metric"] == "grid_import" else "Gastarife"
+                label = {"grid_import": "Stromtarife", "gas": "Gastarife", "water": "Wassertarife"}[values["metric"]]
                 raise ValueError(f"Es können maximal {TARIFF_LIMIT} {label} gespeichert werden.")
             overlap = db.execute(
                 """SELECT 1 FROM energy_tariffs
@@ -1120,7 +1245,7 @@ class Handler(BaseHTTPRequestHandler):
                 "INSERT INTO energy_tariffs(metric,provider,valid_from,valid_to,price_per_kwh,kwh_per_unit,base_fee_monthly,advance_monthly) VALUES(?,?,?,?,?,?,?,?)",
                 (values["metric"], values["provider"], values["valid_from"], values["valid_to"], values["price"], values["factor"], values["base_fee"], values["advance"]),
             )
-        label = "Stromtarif" if values["metric"] == "grid_import" else "Gastarif"
+        label = {"grid_import": "Stromtarif", "gas": "Gastarif", "water": "Wassertarif"}[values["metric"]]
         self.redirect("/energy?notice=" + urllib.parse.quote(f"{label} wurde gespeichert."))
 
     def energy_tariff_edit_page(self, tariff_id, notice):
@@ -1130,9 +1255,15 @@ class Handler(BaseHTTPRequestHandler):
         if not tariff:
             self.send_html(page("Nicht gefunden", '<div class="card empty">Tarif nicht gefunden.</div>'), 404)
             return
-        label = "Stromtarif" if tariff["metric"] == "grid_import" else "Gastarif"
-        factor_field = "" if tariff["metric"] == "grid_import" else f'<div class="field"><label>Umrechnung kWh pro m³</label><input inputmode="decimal" name="kwh_per_unit" value="{fmt_num(tariff["kwh_per_unit"], 4)}" required></div>'
-        body = f"""<div class="topbar"><div><h1>{label} bearbeiten</h1><div class="subtitle">Vertragsdaten, Grundpreis und Abschlag ergänzen oder ändern</div></div></div><div class="card"><form method="post" action="/energy/tariffs/{tariff_id}/update"><input type="hidden" name="csrf" value="{csrf_for(token)}"><input type="hidden" name="metric" value="{esc(tariff['metric'])}"><div class="form-grid"><div class="field full"><label>Anbieter</label><input name="provider" maxlength="100" value="{esc(tariff['provider'])}" required></div><div class="field"><label>Gültig von</label><input type="date" name="valid_from" value="{esc(tariff['valid_from'])}" required></div><div class="field"><label>Gültig bis</label><input type="date" name="valid_to" value="{esc(tariff['valid_to'] or '')}"></div><div class="field"><label>Arbeitspreis in Cent/kWh</label><input inputmode="decimal" name="price_per_kwh" value="{fmt_num(tariff['price_per_kwh'] * 100, 2)}" required></div>{factor_field}<div class="field"><label>Grundpreis in €/Monat</label><input inputmode="decimal" name="base_fee_monthly" value="{fmt_num(tariff['base_fee_monthly'], 2)}" required></div><div class="field"><label>Abschlag in €/Monat</label><input inputmode="decimal" name="advance_monthly" value="{fmt_num(tariff['advance_monthly'], 2)}" required></div></div><div class="actions" style="margin-top:18px"><button class="btn">Änderungen speichern</button><a class="btn secondary" href="/energy">Abbrechen</a></div></form></div>"""
+        label = {"grid_import": "Stromtarif", "gas": "Gastarif", "water": "Wassertarif"}[tariff["metric"]]
+        factor_field = f'<div class="field"><label>Umrechnung kWh pro m³</label><input inputmode="decimal" name="kwh_per_unit" value="{fmt_num(tariff["kwh_per_unit"], 4)}" required></div>' if tariff["metric"] == "gas" else ""
+        if tariff["metric"] == "water":
+            price_label = "Verbrauchspreis in €/m³"
+            price_value = fmt_num(tariff["price_per_kwh"], 4)
+        else:
+            price_label = "Arbeitspreis in Cent/kWh"
+            price_value = fmt_num(tariff["price_per_kwh"] * 100, 2)
+        body = f"""<div class="topbar"><div><h1>{label} bearbeiten</h1><div class="subtitle">Vertragsdaten, Grundpreis und Abschlag ergänzen oder ändern</div></div></div><div class="card"><form method="post" action="/energy/tariffs/{tariff_id}/update"><input type="hidden" name="csrf" value="{csrf_for(token)}"><input type="hidden" name="metric" value="{esc(tariff['metric'])}"><div class="form-grid"><div class="field full"><label>Anbieter</label><input name="provider" maxlength="100" value="{esc(tariff['provider'])}" required></div><div class="field"><label>Gültig von</label><input type="date" name="valid_from" value="{esc(tariff['valid_from'])}" required></div><div class="field"><label>Gültig bis</label><input type="date" name="valid_to" value="{esc(tariff['valid_to'] or '')}"></div><div class="field"><label>{price_label}</label><input inputmode="decimal" name="price_per_kwh" value="{price_value}" required></div>{factor_field}<div class="field"><label>Grundpreis in €/Monat</label><input inputmode="decimal" name="base_fee_monthly" value="{fmt_num(tariff['base_fee_monthly'], 2)}" required></div><div class="field"><label>Abschlag in €/Monat</label><input inputmode="decimal" name="advance_monthly" value="{fmt_num(tariff['advance_monthly'], 2)}" required></div></div><div class="actions" style="margin-top:18px"><button class="btn">Änderungen speichern</button><a class="btn secondary" href="/energy">Abbrechen</a></div></form></div>"""
         self.send_html(page(f"{label} bearbeiten", body, "/energy", notice))
 
     def update_energy_tariff(self, tariff_id, form):

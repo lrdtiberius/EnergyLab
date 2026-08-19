@@ -83,9 +83,52 @@ class EnergyLabTests(unittest.TestCase):
         with app.connect() as db:
             rows = db.execute("SELECT * FROM energy_readings ORDER BY read_on").fetchall()
         self.assertEqual(len(rows), 2)
-        self.assertEqual(rows[0]["delta_value"], 5.5)
+        self.assertIsNone(rows[0]["delta_value"])
         self.assertEqual(rows[1]["total_value"], 1007.0)
+        self.assertEqual(rows[1]["delta_value"], 7.0)
         self.assertEqual(rows[1]["source"], "home_assistant_history")
+
+    def test_sensor_outages_and_implausible_jumps_are_excluded(self):
+        with app.connect() as db:
+            data = [
+                ("2026-04-01", 10127.0),
+                ("2026-04-02", 0.0),
+                ("2026-04-03", 10128.0),
+                ("2026-04-04", 25000.0),
+                ("2026-04-05", 10130.0),
+            ]
+            for read_on, total in data:
+                db.execute(
+                    "INSERT INTO energy_readings(metric,read_on,total_value,delta_value,unit,entity_id) VALUES(?,?,?,?,?,?)",
+                    ("grid_import", read_on, total, 99999, "kWh", "sensor.example_grid"),
+                )
+            rejected = app.sanitize_cumulative_readings(db, "grid_import")
+            rows = db.execute(
+                "SELECT read_on,delta_value,is_valid,invalid_reason FROM energy_readings WHERE metric='grid_import' ORDER BY read_on"
+            ).fetchall()
+        self.assertEqual(rejected, 2)
+        self.assertIsNone(rows[0]["delta_value"])
+        self.assertEqual(rows[1]["is_valid"], 0)
+        self.assertIn("Nullwert", rows[1]["invalid_reason"])
+        self.assertAlmostEqual(rows[2]["delta_value"], 1.0)
+        self.assertEqual(rows[3]["is_valid"], 0)
+        self.assertIn("Zählersprung", rows[3]["invalid_reason"])
+        self.assertAlmostEqual(rows[4]["delta_value"], 2.0)
+
+    def test_offline_gap_scales_plausibility_window(self):
+        with app.connect() as db:
+            for read_on, total in (("2026-01-01", 3600.0), ("2026-01-02", 3605.0), ("2026-01-10", 3640.0)):
+                db.execute(
+                    "INSERT INTO energy_readings(metric,read_on,total_value,delta_value,unit,entity_id) VALUES(?,?,?,?,?,?)",
+                    ("gas", read_on, total, None, "m³", "sensor.example_gas"),
+                )
+            rejected = app.sanitize_cumulative_readings(db, "gas")
+            latest = db.execute(
+                "SELECT delta_value,is_valid FROM energy_readings WHERE metric='gas' ORDER BY read_on DESC LIMIT 1"
+            ).fetchone()
+        self.assertEqual(rejected, 0)
+        self.assertEqual(latest["is_valid"], 1)
+        self.assertAlmostEqual(latest["delta_value"], 35.0)
 
     def test_energy_tariffs_calculate_period_costs(self):
         self.assertAlmostEqual(app.tariff_price_to_eur("grid_import", "32,90"), 0.329)
@@ -172,6 +215,30 @@ class EnergyLabTests(unittest.TestCase):
             ).fetchone()["total_value"]
         self.assertAlmostEqual(unchanged, 102.0)
 
+    def test_water_tariff_calculates_costs_and_balance(self):
+        with app.connect() as db:
+            db.execute(
+                "INSERT INTO energy_readings(metric,read_on,total_value,delta_value,unit,entity_id) VALUES(?,?,?,?,?,?)",
+                ("water", "2025-01-01", 100, None, "m³", "manual"),
+            )
+            db.execute(
+                "INSERT INTO energy_readings(metric,read_on,total_value,delta_value,unit,entity_id) VALUES(?,?,?,?,?,?)",
+                ("water", "2025-01-31", 110, 10, "m³", "manual"),
+            )
+            db.execute(
+                """INSERT INTO energy_tariffs(
+                       metric,provider,valid_from,valid_to,price_per_kwh,kwh_per_unit,
+                       base_fee_monthly,advance_monthly
+                   ) VALUES(?,?,?,?,?,?,?,?)""",
+                ("water", "Wasserwerk", "2025-01-01", "2025-01-31", 4.25, 1.0, 8.5, 60.0),
+            )
+            values = app.energy_finances(db)["water"]
+        self.assertAlmostEqual(values["variable"], 42.5)
+        self.assertAlmostEqual(values["base_fee"], 8.5)
+        self.assertAlmostEqual(values["cost"], 51.0)
+        self.assertAlmostEqual(values["advance"], 60.0)
+        self.assertAlmostEqual(values["balance"], 9.0)
+
     def test_existing_tariffs_gain_provider_column(self):
         with app.connect() as db:
             db.execute("DROP TABLE energy_tariffs")
@@ -193,6 +260,10 @@ class EnergyLabTests(unittest.TestCase):
         app.init_db()
         with app.connect() as db:
             row = db.execute("SELECT provider,base_fee_monthly,advance_monthly FROM energy_tariffs").fetchone()
+            db.execute(
+                "INSERT INTO energy_tariffs(metric,provider,valid_from,price_per_kwh,kwh_per_unit) VALUES(?,?,?,?,?)",
+                ("water", "Wasserwerk", "2026-01-01", 4.25, 1.0),
+            )
         self.assertEqual(row["provider"], "")
         self.assertEqual(row["base_fee_monthly"], 0)
         self.assertEqual(row["advance_monthly"], 0)
@@ -207,12 +278,17 @@ class EnergyLabTests(unittest.TestCase):
                 "INSERT INTO energy_tariffs(metric,provider,valid_from,valid_to,price_per_kwh,kwh_per_unit) VALUES(?,?,?,?,?,?)",
                 ("gas", "Altgas", "2024-01-01", "2024-12-31", 10.9, 10.5),
             )
+            db.execute(
+                "INSERT INTO energy_tariffs(metric,provider,valid_from,valid_to,price_per_kwh,kwh_per_unit) VALUES(?,?,?,?,?,?)",
+                ("water", "Wasser", "2024-01-01", "2024-12-31", 6.0, 1.0),
+            )
         app.init_db()
         app.init_db()
         with app.connect() as db:
             prices = {row["metric"]: row["price_per_kwh"] for row in db.execute("SELECT metric,price_per_kwh FROM energy_tariffs")}
         self.assertAlmostEqual(prices["grid_import"], 0.329)
         self.assertAlmostEqual(prices["gas"], 0.109)
+        self.assertAlmostEqual(prices["water"], 6.0)
 
 
 if __name__ == "__main__":
