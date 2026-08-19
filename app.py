@@ -32,7 +32,7 @@ from socketserver import ThreadingMixIn
 
 
 APP_NAME = "EnergieLab"
-APP_VERSION = "0.2.4"
+APP_VERSION = "0.3.0"
 DATA_DIR = Path(os.getenv("ENERGYLAB_DATA_DIR", "/data"))
 DB_PATH = DATA_DIR / "energylab.sqlite3"
 HOST = os.getenv("ENERGYLAB_HOST", "0.0.0.0")
@@ -62,6 +62,13 @@ METRICS = {
         "icon": "🔥",
         "unit": "m³",
         "entity": os.getenv("HA_GAS_ENTITY", "").strip(),
+    },
+    "water": {
+        "label": "Wasser",
+        "icon": "💧",
+        "unit": "m³",
+        "entity": "",
+        "manual_only": True,
     },
 }
 
@@ -319,6 +326,50 @@ def energy_finances(db, start_on=None):
 
 def energy_costs(db, start_on=None):
     return {metric: values["cost"] for metric, values in energy_finances(db, start_on).items()}
+
+
+def pv_savings(db, start_on=None):
+    """Value PV self-consumption at the applicable grid work price without offsetting costs."""
+    where = "AND e.read_on>=?" if start_on else ""
+    args = (start_on,) if start_on else ()
+    row = db.execute(
+        f"""SELECT SUM(e.delta_value * t.price_per_kwh) AS savings
+            FROM energy_readings e
+            JOIN energy_tariffs t ON t.metric='grid_import'
+             AND e.read_on>=t.valid_from
+             AND (t.valid_to IS NULL OR e.read_on<=t.valid_to)
+            WHERE e.metric='pv_self' AND e.delta_value IS NOT NULL {where}""",
+        args,
+    ).fetchone()
+    return row["savings"] if row and row["savings"] is not None else None
+
+
+def save_manual_water_reading(read_on, total_value):
+    read_on = parse_iso_date(read_on)
+    total_value = parse_num(total_value)
+    if not read_on or read_on > date.today().isoformat() or total_value is None or total_value < 0:
+        raise ValueError("Bitte ein gültiges Datum bis heute und einen nichtnegativen Wasserzählerstand eingeben.")
+    with connect() as db:
+        db.execute(
+            """INSERT INTO energy_readings(metric,read_on,total_value,delta_value,unit,entity_id,source)
+               VALUES('water',?,?,NULL,'m³','manual','manual')
+               ON CONFLICT(metric,read_on) DO UPDATE SET
+                 total_value=excluded.total_value,source='manual',entity_id='manual',
+                 unit='m³',created_at=CURRENT_TIMESTAMP""",
+            (read_on, total_value),
+        )
+        rows = db.execute(
+            "SELECT id,total_value FROM energy_readings WHERE metric='water' ORDER BY read_on,id"
+        ).fetchall()
+        previous = None
+        for row in rows:
+            current = row["total_value"]
+            if previous is not None and current < previous:
+                raise ValueError("Der Wasserzählerstand darf gegenüber der vorherigen Eingabe nicht sinken.")
+            delta = None if previous is None else current - previous
+            db.execute("UPDATE energy_readings SET delta_value=? WHERE id=?", (delta, row["id"]))
+            previous = current
+    return read_on, total_value
 
 
 def tariff_price_to_eur(metric: str, value):
@@ -759,6 +810,7 @@ STYLE = r"""
 """
 
 STYLE += r"""
+.grid{grid-template-columns:repeat(auto-fit,minmax(220px,1fr))}
 details.tariff-history{background:linear-gradient(155deg,rgba(31,38,48,.96),rgba(22,27,34,.96));border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow)}
 details.tariff-history summary{cursor:pointer;list-style:none;padding:20px;font-size:19px;font-weight:750;display:flex;justify-content:space-between;gap:12px;align-items:center}
 details.tariff-history summary::-webkit-details-marker{display:none}
@@ -932,6 +984,10 @@ class Handler(BaseHTTPRequestHandler):
                 imported, messages = backfill_home_assistant(str(form.get("start_date", "")))
                 notice = f"{imported} tägliche Historienwerte übernommen. " + "; ".join(messages)
                 self.redirect("/energy?notice=" + urllib.parse.quote(notice))
+            elif path == "/energy/water/save":
+                read_on, total = save_manual_water_reading(form.get("read_on"), form.get("total_value"))
+                notice = f"Wasserzählerstand {fmt_num(total)} m³ vom {read_on} wurde gespeichert."
+                self.redirect("/energy?notice=" + urllib.parse.quote(notice))
             elif path == "/energy/tariffs/save":
                 self.save_energy_tariff(form)
             elif path.startswith("/energy/tariffs/") and path.endswith("/update"):
@@ -951,6 +1007,8 @@ class Handler(BaseHTTPRequestHandler):
         with connect() as db:
             energy = {r["metric"]: r["value"] for r in db.execute(f"SELECT metric,SUM(delta_value) value FROM energy_readings {where} GROUP BY metric", args)}
             costs = energy_costs(db, start)
+            pv_saved = pv_savings(db, start)
+            pv_saved_text = f"−{fmt_money(pv_saved)}" if pv_saved is not None else "–"
             fwhere = "WHERE fueled_on>=?" if start else ""
             fuel_args = (start,) if start else ()
             totals = db.execute(f"SELECT SUM(total_price) cost,SUM(liters) liters,MIN(odometer) minodo,MAX(odometer) maxodo FROM fuelings {fwhere}", fuel_args).fetchone()
@@ -965,8 +1023,9 @@ class Handler(BaseHTTPRequestHandler):
             cards = "".join(
                 [
                     self.metric_card("⚡", "Strombezug", energy.get("grid_import"), "kWh", f'<div class="muted">Kosten: {fmt_money(costs.get("grid_import"))}</div>' + sparkline(db, "grid_import")),
-                    self.metric_card("☀️", "PV-Eigenverbrauch", energy.get("pv_self"), "kWh", sparkline(db, "pv_self")),
+                    self.metric_card("☀️", "PV-Eigenverbrauch", energy.get("pv_self"), "kWh", f'<div class="muted">Dadurch gespart: {pv_saved_text}</div>' + sparkline(db, "pv_self")),
                     self.metric_card("🔥", "Gas", energy.get("gas"), "m³", f'<div class="muted">Kosten: {fmt_money(costs.get("gas"))}</div>' + sparkline(db, "gas")),
+                    self.metric_card("💧", "Wasser", energy.get("water"), "m³", sparkline(db, "water")),
                     self.metric_card("🚐", "T6.1 Ø-Verbrauch", diesel_avg, "l/100 km", ""),
                 ]
             )
@@ -991,6 +1050,10 @@ class Handler(BaseHTTPRequestHandler):
             logs = db.execute("SELECT * FROM sync_log ORDER BY id DESC LIMIT 12").fetchall()
             tariffs = db.execute("SELECT * FROM energy_tariffs ORDER BY valid_from DESC,id DESC").fetchall()
             finances = energy_finances(db)
+            pv_saved = pv_savings(db)
+            water_readings = db.execute(
+                "SELECT * FROM energy_readings WHERE metric='water' ORDER BY read_on DESC,id DESC LIMIT 12"
+            ).fetchall()
         tariff_counts = {
             "grid_import": sum(1 for tariff in tariffs if tariff["metric"] == "grid_import"),
             "gas": sum(1 for tariff in tariffs if tariff["metric"] == "gas"),
@@ -1010,8 +1073,14 @@ class Handler(BaseHTTPRequestHandler):
                 balance_html = f'<span class="badge {balance_class}">{fmt_money(abs(balance))} {balance_label}</span>'
             else:
                 balance_html = "–"
-            rows += f"<tr><td>{cfg['icon']} <strong>{esc(cfg['label'])}</strong></td><td>{esc(cfg['entity'] or 'nicht eingerichtet')}</td><td>{fmt_num(value['total_value'])+' '+esc(value['unit']) if value else '–'}</td><td>{esc(value['read_on']) if value else '–'}</td><td>{variable}</td><td>{base_fee}</td><td><strong>{cost}</strong></td><td>{advance}</td><td>{balance_html if key in ('grid_import', 'gas') else '–'}</td></tr>"
+            entity_label = "manuelle Eingabe" if key == "water" else (cfg["entity"] or "nicht eingerichtet")
+            saving_html = f'<strong>−{fmt_money(pv_saved)}</strong><br><span class="badge ok">dadurch gespart</span>' if key == "pv_self" and pv_saved is not None else "–"
+            rows += f"<tr><td>{cfg['icon']} <strong>{esc(cfg['label'])}</strong></td><td>{esc(entity_label)}</td><td>{fmt_num(value['total_value'])+' '+esc(value['unit']) if value else '–'}</td><td>{esc(value['read_on']) if value else '–'}</td><td>{variable}</td><td>{base_fee}</td><td><strong>{cost}</strong></td><td>{advance}</td><td>{balance_html if key in ('grid_import', 'gas') else '–'}</td><td>{saving_html}</td></tr>"
         logrows = "".join(f"<tr><td>{esc(r['synced_at'])}</td><td><span class=\"badge {'ok' if r['status']=='ok' else 'warn'}\">{esc(r['status'])}</span></td><td>{esc(r['message'])}</td></tr>" for r in logs)
+        waterrows = "".join(
+            f"<tr><td>{esc(r['read_on'])}</td><td>{fmt_num(r['total_value'])} m³</td><td>{fmt_num(r['delta_value']) + ' m³' if r['delta_value'] is not None else 'Erster Stand'}</td></tr>"
+            for r in water_readings
+        )
         tariffrows = ""
         for tariff in tariffs:
             label = "Strombezug" if tariff["metric"] == "grid_import" else "Gas"
@@ -1022,7 +1091,8 @@ class Handler(BaseHTTPRequestHandler):
         default_start = date(date.today().year, 1, 1).isoformat()
         csrf = csrf_for(token)
         body = f"""<div class="topbar"><div><h1>Energie</h1><div class="subtitle">Tägliche Zählerstände aus Home Assistant · {readiness}</div></div><form method="post" action="/energy/sync"><input type="hidden" name="csrf" value="{csrf}"><button class="btn">Jetzt synchronisieren</button></form></div>
-        <div class="card"><div class="table-wrap"><table><thead><tr><th>Messgröße</th><th>HA-Entität</th><th>Letzter Stand</th><th>Datum</th><th>Verbrauchskosten</th><th>Grundpreis</th><th>Gesamtkosten</th><th>Abschläge</th><th>Prognose</th></tr></thead><tbody>{rows}</tbody></table></div><p class="muted" style="padding:0 28px 22px">Verbrauchskosten + Grundpreis = Gesamtkosten. Grundpreis und Abschläge werden innerhalb des Tarifzeitraums taggenau anteilig bis zum letzten Zählerstand berücksichtigt.</p></div>
+        <div class="card"><div class="table-wrap"><table><thead><tr><th>Messgröße</th><th>Datenquelle</th><th>Letzter Stand</th><th>Datum</th><th>Verbrauchskosten</th><th>Grundpreis</th><th>Gesamtkosten</th><th>Abschläge</th><th>Prognose</th><th>PV-Ersparnis</th></tr></thead><tbody>{rows}</tbody></table></div><p class="muted" style="padding:0 28px 22px">Verbrauchskosten + Grundpreis = Gesamtkosten. Die PV-Ersparnis wird separat mit dem gültigen Strom-Arbeitspreis berechnet und reduziert diese Kosten nicht.</p></div>
+        <section class="section card"><div class="section-head"><h2>Wasserzähler manuell erfassen</h2><span class="badge">nur manuell</span></div><div class="two"><form method="post" action="/energy/water/save"><input type="hidden" name="csrf" value="{csrf}"><div class="form-grid"><div class="field"><label>Ablesedatum</label><input type="date" name="read_on" value="{date.today().isoformat()}" max="{date.today().isoformat()}" required></div><div class="field"><label>Zählerstand in m³</label><input inputmode="decimal" name="total_value" placeholder="z. B. 123,456" required></div></div><p class="muted">Eine erneute Eingabe für dasselbe Datum korrigiert den vorhandenen Stand. Die Verbräuche zwischen allen Ablesungen werden danach neu berechnet.</p><button class="btn" style="margin-top:8px">Wasserstand speichern</button></form><div class="table-wrap"><table><thead><tr><th>Datum</th><th>Zählerstand</th><th>Verbrauch seit davor</th></tr></thead><tbody>{waterrows or '<tr><td colspan="3" class="empty">Noch keine Wasserstände erfasst</td></tr>'}</tbody></table></div></div></section>
         <section class="section two"><div class="card"><div class="section-head"><h2>Historie einmalig importieren</h2></div><p class="muted">Übernimmt vorhandene tägliche Langzeitstatistiken aus Home Assistant. Ein erneuter Lauf aktualisiert dieselben Tage und erzeugt keine Duplikate.</p><form method="post" action="/energy/backfill"><input type="hidden" name="csrf" value="{csrf}"><div class="field"><label>Historie ab</label><input type="date" name="start_date" value="{default_start}" max="{date.today().isoformat()}" required></div><button class="btn" style="margin-top:18px">Historie importieren</button></form></div>
         <div class="card"><div class="section-head"><h2>Stromtarif hinzufügen</h2><span class="badge">{tariff_counts['grid_import']} von {TARIFF_LIMIT}</span></div><form method="post" action="/energy/tariffs/save"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="metric" value="grid_import"><div class="form-grid"><div class="field full"><label>Anbieter</label><input name="provider" maxlength="100" placeholder="z. B. Stadtwerke Musterstadt" required></div><div class="field"><label>Gültig von</label><input type="date" name="valid_from" required></div><div class="field"><label>Gültig bis</label><input type="date" name="valid_to"></div><div class="field"><label>Strompreis in Cent/kWh</label><input inputmode="decimal" name="price_per_kwh" placeholder="z. B. 32,90" required></div><div class="field"><label>Grundpreis in €/Monat</label><input inputmode="decimal" name="base_fee_monthly" placeholder="z. B. 12,50" required></div><div class="field full"><label>Abschlag in €/Monat</label><input inputmode="decimal" name="advance_monthly" placeholder="z. B. 95,00" required></div></div><button class="btn" style="margin-top:18px" {'disabled' if tariff_counts['grid_import'] >= TARIFF_LIMIT else ''}>Stromtarif speichern</button>{'<p class="muted">Das Limit von fünf Stromtarifen ist erreicht. Lösche bei Bedarf einen alten Zeitraum.</p>' if tariff_counts['grid_import'] >= TARIFF_LIMIT else ''}</form></div></section>
         <section class="section card"><div class="section-head"><h2>Gastarif hinzufügen</h2><span class="badge">{tariff_counts['gas']} von {TARIFF_LIMIT}</span></div><form method="post" action="/energy/tariffs/save"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="metric" value="gas"><div class="form-grid"><div class="field full"><label>Anbieter</label><input name="provider" maxlength="100" placeholder="z. B. Stadtwerke Musterstadt" required></div><div class="field"><label>Gültig von</label><input type="date" name="valid_from" required></div><div class="field"><label>Gültig bis</label><input type="date" name="valid_to"></div><div class="field"><label>Gaspreis in Cent/kWh</label><input inputmode="decimal" name="price_per_kwh" placeholder="z. B. 10,90" required></div><div class="field"><label>Umrechnung kWh pro m³</label><input inputmode="decimal" name="kwh_per_unit" placeholder="laut Gasabrechnung, z. B. 10,42" required></div><div class="field"><label>Grundpreis in €/Monat</label><input inputmode="decimal" name="base_fee_monthly" placeholder="z. B. 14,00" required></div><div class="field"><label>Abschlag in €/Monat</label><input inputmode="decimal" name="advance_monthly" placeholder="z. B. 120,00" required></div></div><p class="muted">Der Gaszähler liefert m³. Den periodenbezogenen Umrechnungsfaktor findest du auf der Gasabrechnung.</p><button class="btn" style="margin-top:8px" {'disabled' if tariff_counts['gas'] >= TARIFF_LIMIT else ''}>Gastarif speichern</button>{'<p class="muted">Das Limit von fünf Gastarifen ist erreicht. Lösche bei Bedarf einen alten Zeitraum.</p>' if tariff_counts['gas'] >= TARIFF_LIMIT else ''}</form></section>
@@ -1263,7 +1333,7 @@ class Handler(BaseHTTPRequestHandler):
             coffee = f'<a class="btn coffee" href="{esc(COFFEE_URL)}" target="_blank" rel="noopener noreferrer">☕ Buy me a coffee</a>'
         else:
             coffee = '<span class="btn secondary" title="BUY_ME_A_COFFEE_URL im Portainer-Stack eintragen">☕ Buy me a coffee</span><div class="muted" style="margin-top:10px">Coffee-Link noch im Stack eintragen</div>'
-        body = f"""<div class="topbar"><div><h1>Unterstützung</h1><div class="subtitle">Über EnergieLab</div></div></div><div class="card support"><div class="coffee-cup">☕</div><div class="credit">Idea und umsetztung by Lrd.Tiberius</div><p class="muted">EnergieLab bündelt Energie-, Gas- und Fahrzeugverbräuche lokal in deinem Homelab.</p><div style="margin-top:24px">{coffee}</div><div class="actions" style="justify-content:center;margin-top:28px"><a class="btn secondary" href="/export/backup.json">JSON-Backup</a><a class="btn secondary" href="/export/fuelings.csv">Tankungen als CSV</a></div></div>"""
+        body = f"""<div class="topbar"><div><h1>Unterstützung</h1><div class="subtitle">Über EnergieLab</div></div></div><div class="card support"><div class="coffee-cup">☕</div><div class="credit">Idea und umsetztung by Lrd.Tiberius</div><p class="muted">EnergieLab bündelt Strom-, PV-, Gas-, Wasser- und Fahrzeugverbräuche lokal in deinem Homelab.</p><div style="margin-top:24px">{coffee}</div><div class="actions" style="justify-content:center;margin-top:28px"><a class="btn secondary" href="/export/backup.json">JSON-Backup</a><a class="btn secondary" href="/export/fuelings.csv">Tankungen als CSV</a></div></div>"""
         self.send_html(page("Unterstützung", body, "/support"))
 
     def backup_json(self):
