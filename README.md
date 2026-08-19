@@ -7,7 +7,9 @@ EnergyLab bündelt Strom-, PV-, Gas- und Fahrzeugverbräuche lokal im eigenen Ho
 - tägliche Übernahme fortlaufender Zählerstände aus Home Assistant
 - einmaliger Rückimport vorhandener täglicher Home-Assistant-Langzeitstatistiken
 - bis zu fünf Strom- und fünf Gastarife mit frei wählbaren Gültigkeitszeiträumen
-- periodengenaue Kostenberechnung; Gas mit kWh/m³-Faktor der Abrechnung
+- periodengenaue Kostenberechnung mit Arbeitspreis und monatlichem Grundpreis
+- Abschlagsprognose mit sichtbarem Guthaben oder voraussichtlicher Nachzahlung
+- Gasberechnung mit kWh/m³-Faktor der Abrechnung
 - Dashboard für Monat, Jahr und Gesamtzeitraum
 - mehrere Fahrzeuge mit jeweils erlaubten Betriebsstoffen
 - Voll- und Teiltankungen mit Voll-zu-Voll-Verbrauchsberechnung
@@ -40,7 +42,9 @@ Die Anwendung liest einmal täglich den aktuellen Zählerstand. Der Tagesverbrau
 
 Auf der Seite **Energie** kann ein Startdatum für einen einmaligen Historienimport gewählt werden. Verfügbar sind nur Zeiträume, für die Home Assistant Langzeitstatistiken des jeweiligen Sensors gespeichert hat. Wiederholte Importe aktualisieren dieselben Tage, statt Dubletten anzulegen.
 
-Stromtarife werden mit Anbieter und Cent/kWh, Gastarife mit Anbieter und €/kWh eingegeben. Die gespeicherten Vertragszeiträume lassen sich auf der Energie-Seite aufklappen. Pro Tarifart können bis zu fünf Zeiträume hinterlegt werden. Da der Gaszähler m³ liefert, wird beim Gastarif außerdem der Umrechnungsfaktor in kWh/m³ aus der jeweiligen Gasabrechnung eingetragen.
+Strom- und Gastarife werden mit Anbieter und Cent/kWh eingegeben. Intern rechnet EnergyLab Cent automatisch in Euro um. Beim Update werden ältere, versehentlich als Euro gespeicherte Centpreise einmalig korrigiert. Je Tarifzeitraum werden außerdem der monatliche Grundpreis und der monatliche Abschlag als Brutto-Beträge in Euro gespeichert. Die Energie-Seite zeigt Verbrauchskosten, anteiligen Grundpreis, Gesamtkosten, berücksichtigte Abschläge und daraus das voraussichtliche Guthaben oder die Nachzahlung getrennt an. Bei angebrochenen Monaten werden Grundpreis und Abschlag taggenau anteilig bis zum letzten Zählerstand berechnet.
+
+Die gespeicherten Vertragszeiträume lassen sich auf der Energie-Seite aufklappen und bearbeiten. Pro Tarifart können bis zu fünf Zeiträume hinterlegt werden. Da der Gaszähler m³ liefert, wird beim Gastarif außerdem der Umrechnungsfaktor in kWh/m³ aus der jeweiligen Gasabrechnung eingetragen.
 
 Für den Zugriff wird in Home Assistant unter **Profil → Sicherheit → Langlebige Zugriffstoken** ein Token erzeugt und ausschließlich lokal als `HA_TOKEN` im Portainer-Stack eingetragen.
 
