@@ -6,9 +6,11 @@ EnergyLab bündelt Strom-, PV-, Gas- und Fahrzeugverbräuche lokal im eigenen Ho
 
 - tägliche Übernahme fortlaufender Zählerstände aus Home Assistant
 - einmaliger Rückimport vorhandener täglicher Home-Assistant-Langzeitstatistiken
+- manuelle Wasserzählerstände mit automatisch neu berechneten Verbrauchsdifferenzen
 - bis zu fünf Strom- und fünf Gastarife mit frei wählbaren Gültigkeitszeiträumen
 - periodengenaue Kostenberechnung mit Arbeitspreis und monatlichem Grundpreis
 - Abschlagsprognose mit sichtbarem Guthaben oder voraussichtlicher Nachzahlung
+- separat ausgewiesene PV-Ersparnis zum jeweils gültigen Strom-Arbeitspreis
 - Gasberechnung mit kWh/m³-Faktor der Abrechnung
 - Dashboard für Monat, Jahr und Gesamtzeitraum
 - mehrere Fahrzeuge mit jeweils erlaubten Betriebsstoffen
@@ -45,6 +47,8 @@ Auf der Seite **Energie** kann ein Startdatum für einen einmaligen Historienimp
 Strom- und Gastarife werden mit Anbieter und Cent/kWh eingegeben. Intern rechnet EnergyLab Cent automatisch in Euro um. Beim Update werden ältere, versehentlich als Euro gespeicherte Centpreise einmalig korrigiert. Je Tarifzeitraum werden außerdem der monatliche Grundpreis und der monatliche Abschlag als Brutto-Beträge in Euro gespeichert. Die Energie-Seite zeigt Verbrauchskosten, anteiligen Grundpreis, Gesamtkosten, berücksichtigte Abschläge und daraus das voraussichtliche Guthaben oder die Nachzahlung getrennt an. Bei angebrochenen Monaten werden Grundpreis und Abschlag taggenau anteilig bis zum letzten Zählerstand berechnet.
 
 Die gespeicherten Vertragszeiträume lassen sich auf der Energie-Seite aufklappen und bearbeiten. Pro Tarifart können bis zu fünf Zeiträume hinterlegt werden. Da der Gaszähler m³ liefert, wird beim Gastarif außerdem der Umrechnungsfaktor in kWh/m³ aus der jeweiligen Gasabrechnung eingetragen.
+
+Der PV-Eigenverbrauch wird mit dem im jeweiligen Zeitraum gültigen Strom-Arbeitspreis bewertet. EnergyLab zeigt diesen Betrag separat und negativ als „dadurch gespart“ an. Die Ersparnis wird ausdrücklich nicht von den tatsächlichen Stromkosten abgezogen. Wasser wird ohne Home-Assistant-Sensor ausschließlich über manuelle Zählerstände mit Ablesedatum erfasst; bei rückwirkenden Ergänzungen oder Korrekturen berechnet EnergyLab alle betroffenen Verbrauchsdifferenzen neu.
 
 Für den Zugriff wird in Home Assistant unter **Profil → Sicherheit → Langlebige Zugriffstoken** ein Token erzeugt und ausschließlich lokal als `HA_TOKEN` im Portainer-Stack eingetragen.
 

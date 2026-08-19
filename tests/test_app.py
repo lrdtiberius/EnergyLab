@@ -132,6 +132,46 @@ class EnergyLabTests(unittest.TestCase):
         self.assertAlmostEqual(values["advance"], 100.0)
         self.assertAlmostEqual(values["balance"], 55.1)
 
+    def test_pv_savings_use_grid_work_price_without_reducing_costs(self):
+        with app.connect() as db:
+            db.execute(
+                "INSERT INTO energy_readings(metric,read_on,total_value,delta_value,unit,entity_id) VALUES(?,?,?,?,?,?)",
+                ("grid_import", "2025-01-31", 1000, 100, "kWh", "sensor.example_grid"),
+            )
+            db.execute(
+                "INSERT INTO energy_readings(metric,read_on,total_value,delta_value,unit,entity_id) VALUES(?,?,?,?,?,?)",
+                ("pv_self", "2025-01-31", 500, 50, "kWh", "sensor.example_pv"),
+            )
+            db.execute(
+                "INSERT INTO energy_tariffs(metric,provider,valid_from,valid_to,price_per_kwh,kwh_per_unit) VALUES(?,?,?,?,?,?)",
+                ("grid_import", "Beispiel", "2025-01-01", "2025-12-31", 0.329, 1.0),
+            )
+            costs = app.energy_costs(db)
+            saved = app.pv_savings(db)
+        self.assertAlmostEqual(costs["grid_import"], 32.9)
+        self.assertNotIn("pv_self", costs)
+        self.assertAlmostEqual(saved, 16.45)
+
+    def test_manual_water_readings_recalculate_differences(self):
+        app.save_manual_water_reading("2025-01-01", "100,000")
+        app.save_manual_water_reading("2025-01-15", "103,500")
+        app.save_manual_water_reading("2025-01-10", "102,000")
+        with app.connect() as db:
+            rows = db.execute(
+                "SELECT read_on,total_value,delta_value FROM energy_readings WHERE metric='water' ORDER BY read_on"
+            ).fetchall()
+        self.assertEqual([row["read_on"] for row in rows], ["2025-01-01", "2025-01-10", "2025-01-15"])
+        self.assertIsNone(rows[0]["delta_value"])
+        self.assertAlmostEqual(rows[1]["delta_value"], 2.0)
+        self.assertAlmostEqual(rows[2]["delta_value"], 1.5)
+        with self.assertRaises(ValueError):
+            app.save_manual_water_reading("2025-01-10", "104,000")
+        with app.connect() as db:
+            unchanged = db.execute(
+                "SELECT total_value FROM energy_readings WHERE metric='water' AND read_on='2025-01-10'"
+            ).fetchone()["total_value"]
+        self.assertAlmostEqual(unchanged, 102.0)
+
     def test_existing_tariffs_gain_provider_column(self):
         with app.connect() as db:
             db.execute("DROP TABLE energy_tariffs")
