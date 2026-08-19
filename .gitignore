@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.sqlite3
+data/
+.env
+.env.*
+!*.example
+*_fuelings.csv
+*.csv
+*.png
+*.jpg
+*.jpeg
+*.webp
