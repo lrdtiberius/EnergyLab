@@ -15,6 +15,10 @@ Die Detailansichten von Strom, PV-Eigenverbrauch, Gas und Wasser lassen sich jet
 
 Die Version 0.6.1 ist ein vollständiges Standalone-Release und benötigt keinen Patch sowie keine ältere Programmversion. Beim Update bleibt das vorhandene Docker-Volume erhalten.
 
+## Installation und Einrichtung
+
+Die vollständige Schritt-für-Schritt-Anleitung für Portainer, Docker Compose, Home Assistant, Sensoren, Historienimport, Tarife, Wasser und Datensicherung steht in [INSTALLATION.md](INSTALLATION.md).
+
 ## Funktionen
 
 - Dashboard für Strom, PV-Eigenverbrauch, Gas und Wasser
