@@ -285,11 +285,17 @@ class EnergyLabTests(unittest.TestCase):
         self.assertIn("August 2025", capture.html)
         self.assertIn("month=2025-09", capture.html)
         self.assertIn("Erster Monat mit Quelldaten", capture.html)
+        self.assertIn('href="/energy/grid_import?period=month">Zum aktuellen Monat</a>', capture.html)
         self.assertIn("4,00 kWh", capture.html)
         self.assertIn("02.08.2025", capture.html)
         self.assertNotIn("01.09.2025", capture.html)
         self.assertNotIn("Voraussichtliche Erstattung", capture.html)
         self.assertNotIn("Voraussichtliche Nachzahlung", capture.html)
+
+        current = PageCapture()
+        app.Handler.energy_detail_page(current, "grid_import", "month", date.today().strftime("%Y-%m"))
+        self.assertIn('current-month-link disabled', current.html)
+        self.assertIn('aria-disabled="true">Zum aktuellen Monat</span>', current.html)
 
     def test_pv_savings_use_grid_work_price_without_reducing_costs(self):
         with app.connect() as db:

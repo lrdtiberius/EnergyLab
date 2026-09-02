@@ -33,7 +33,7 @@ from socketserver import ThreadingMixIn
 
 
 APP_NAME = "EnergieLab"
-APP_VERSION = "0.6.0"
+APP_VERSION = "0.6.1"
 DATA_DIR = Path(os.getenv("ENERGYLAB_DATA_DIR", "/data"))
 DB_PATH = DATA_DIR / "energylab.sqlite3"
 HOST = os.getenv("ENERGYLAB_HOST", "0.0.0.0")
@@ -1285,7 +1285,7 @@ button:disabled{opacity:.45;cursor:not-allowed;filter:none}
 .metric-link{display:block;color:var(--text);transition:transform .16s ease,border-color .16s ease}.metric-link:hover{transform:translateY(-2px);border-color:var(--blue);text-decoration:none}
 .detail-chart{width:100%;min-width:620px;height:280px;display:block}.chart-grid line{stroke:var(--line);stroke-width:1}.chart-grid text,.axis-label{fill:var(--muted);font-size:12px}.chart-line polyline{fill:none;stroke:var(--cyan);stroke-width:3;stroke-linecap:round;stroke-linejoin:round}.invalid-point{fill:var(--red);stroke:#ffd4d4;stroke-width:2}.chart-legend{display:flex;gap:18px;flex-wrap:wrap;color:var(--muted);font-size:12px}.legend-line:before{content:"";display:inline-block;width:24px;border-top:3px solid var(--cyan);vertical-align:middle;margin-right:7px}.legend-invalid:before{content:"";display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--red);margin-right:7px}
 .summary-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px}.summary-box{background:#111820;border:1px solid var(--line);border-radius:13px;padding:14px}.summary-box .value{font-size:22px;font-weight:800;margin-top:5px}.summary-box .value.ok{color:var(--green)}.summary-box .value.warn{color:#ffb0b0}.reading-invalid td{background:rgba(255,107,107,.06);color:#ffc8cc}
-.month-nav{display:grid;grid-template-columns:46px minmax(180px,280px) 46px;align-items:center;justify-content:center;gap:12px;margin:-8px 0 22px}.month-nav .month-title{text-align:center}.month-nav .month-title strong{display:block;font-size:19px}.month-arrow{width:46px;height:42px;border-radius:11px;display:grid;place-items:center;background:var(--panel2);border:1px solid var(--line);color:var(--text);font-size:25px;line-height:1}.month-arrow:hover{border-color:var(--blue);text-decoration:none}.month-arrow.disabled{opacity:.35;cursor:not-allowed}
+.month-nav{display:grid;grid-template-columns:46px minmax(180px,280px) 46px;align-items:center;justify-content:center;gap:12px;margin:-8px 0 22px}.month-nav .month-title{text-align:center}.month-nav .month-title strong{display:block;font-size:19px}.month-arrow{width:46px;height:42px;border-radius:11px;display:grid;place-items:center;background:var(--panel2);border:1px solid var(--line);color:var(--text);font-size:25px;line-height:1}.month-arrow:hover{border-color:var(--blue);text-decoration:none}.month-arrow.disabled{opacity:.35;cursor:not-allowed}.current-month-link{grid-column:1/-1;justify-self:center;margin-top:2px}.current-month-link.disabled{opacity:.45;cursor:not-allowed}
 .comparison-delta{font-weight:800}.comparison-delta.more{color:var(--orange)}.comparison-delta.less{color:var(--green)}.comparison-delta.same{color:var(--muted)}.comparison-percent{display:block;font-size:12px;font-weight:600;margin-top:2px}
 @media(max-width:1000px){.settlement-grid{grid-template-columns:1fr}}
 """
@@ -1752,7 +1752,12 @@ class Handler(BaseHTTPRequestHandler):
                 if next_month
                 else '<span class="month-arrow disabled" aria-disabled="true" title="Aktueller Monat">›</span>'
             )
-            month_navigation = f'<div class="month-nav">{previous_control}<div class="month-title"><span class="muted">Monatsübersicht</span><strong>{month_label(selected_month)}</strong></div>{next_control}</div>'
+            current_control = (
+                f'<a class="btn secondary current-month-link" href="/energy/{metric}?period=month">Zum aktuellen Monat</a>'
+                if selected_month < current_month
+                else '<span class="btn secondary current-month-link disabled" aria-disabled="true">Zum aktuellen Monat</span>'
+            )
+            month_navigation = f'<div class="month-nav">{previous_control}<div class="month-title"><span class="muted">Monatsübersicht</span><strong>{month_label(selected_month)}</strong></div>{next_control}{current_control}</div>'
         invalid_count = sum(1 for row in readings if not row["is_valid"])
         values = finances.get(metric)
 
