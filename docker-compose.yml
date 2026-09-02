@@ -1,0 +1,22 @@
+services:
+  energylab:
+    image: ghcr.io/lrdtiberius/energylab:latest
+    container_name: energylab
+    restart: unless-stopped
+    ports:
+      - "8090:8090"
+    environment:
+      TZ: "Europe/Berlin"
+      HA_URL: "http://homeassistant.local:8123"
+      HA_TOKEN: ""
+      HA_GRID_IMPORT_ENTITY: ""
+      HA_PV_SELF_ENTITY: ""
+      HA_GAS_ENTITY: ""
+      ENERGYLAB_SYNC_HOUR: "23"
+      ENERGYLAB_SYNC_MINUTE: "30"
+      BUY_ME_A_COFFEE_URL: "https://www.paypal.com/paypalme/SebastianM207"
+    volumes:
+      - energylab_data:/data
+
+volumes:
+  energylab_data:
