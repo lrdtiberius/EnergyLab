@@ -1,5 +1,13 @@
 # Änderungsverlauf
 
+## 0.6.1 – Standalone-Release
+
+### Neu
+
+- direkter Button **„Zum aktuellen Monat“** in allen Energie-Monatsansichten
+- deaktivierter, klar erkennbarer Zustand, wenn bereits der aktuelle Monat geöffnet ist
+- weiterhin vollständige Standalone-Installation ohne Patch oder vorherige Version
+
 ## 0.6.0 – Standalone-Release
 
 ### Neu
@@ -28,4 +36,3 @@ Version 0.6.0 ist vollständig und benötigt weder einen Patch noch eine vorheri
 ### Datenschutz
 
 Der veröffentlichte Stand enthält keine persönlichen Home-Assistant-Konfigurationen, Sensor-IDs, Zugangsdaten, Messwerte, Tarife oder Verträge.
-
