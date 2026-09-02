@@ -1,71 +1,70 @@
 # EnergyLab
 
-EnergyLab bündelt Strom-, PV-, Gas- und Fahrzeugverbräuche lokal im eigenen Homelab.
+EnergyLab ist ein schlankes, lokal betriebenes Dashboard für Energie-, Wasser- und Fahrzeugdaten. Die Anwendung läuft als einzelner Docker-Container, speichert ihre Daten in SQLite und kann Zählerstände aus Home Assistant übernehmen.
+
+## Release 0.6.0
+
+Die Detailansichten von Strom, PV-Eigenverbrauch, Gas und Wasser lassen sich jetzt monatsweise durchblättern:
+
+- vorherige Monate direkt in der jeweiligen Energieansicht öffnen
+- bis zum aktuellen Monat wieder vorwärts navigieren
+- Verbrauch, Kosten, Messwerte und Diagramme passend zum gewählten Monat berechnen
+- zukünftige Monate automatisch sperren
+- Abrechnungshochrechnung nur dort anzeigen, wo sie fachlich sinnvoll ist
+
+Die Version 0.6.0 ist ein vollständiges Standalone-Release und benötigt keinen Patch sowie keine ältere Programmversion. Beim Update bleibt das vorhandene Docker-Volume erhalten.
 
 ## Funktionen
 
-- tägliche Übernahme fortlaufender Zählerstände aus Home Assistant
-- einmaliger Rückimport vorhandener täglicher Home-Assistant-Langzeitstatistiken
-- manuelle Wasserzählerstände mit automatisch neu berechneten Verbrauchsdifferenzen
-- bis zu fünf Strom-, Gas- und Wassertarife mit frei wählbaren Gültigkeitszeiträumen
-- automatische Plausibilitätsprüfung für Nullwerte, Zählerrücksprünge und extreme Sprünge
-- periodengenaue Kostenberechnung mit Arbeitspreis und monatlichem Grundpreis
-- Abschlagsprognose mit sichtbarem Guthaben oder voraussichtlicher Nachzahlung
-- separat ausgewiesene PV-Ersparnis zum jeweils gültigen Strom-Arbeitspreis
-- Gasberechnung mit kWh/m³-Faktor der Abrechnung
-- Dashboard für Monat, Jahr und Gesamtzeitraum
-- mehrere Fahrzeuge mit jeweils erlaubten Betriebsstoffen
-- Voll- und Teiltankungen mit Voll-zu-Voll-Verbrauchsberechnung
-- getrennte AdBlue-Auswertung in l/1.000 km
-- Spritmonitor-CSV-Import mit Vorschau, Dublettenprüfung und Preisnormalisierung
-- lokaler JSON- und CSV-Export
-- responsive Weboberfläche für das lokale Homelab
+- Dashboard für Strom, PV-Eigenverbrauch, Gas und Wasser
+- Tages-, Monats- und Jahresauswertungen mit Detailtabellen und Diagrammen
+- Plausibilitätsprüfung für Nullwerte, Zählerrücksprünge und unrealistische Sprünge
+- Home-Assistant-Synchronisierung und Import vorhandener Langzeitstatistiken
+- automatische Synchronisierung täglich um 23:30 Uhr in `Europe/Berlin`
+- sichtbarer Datenstand mit Datum und Uhrzeit
+- Tarifzeiträume mit Anbieter, Verbrauchspreis, Grundpreis und Abschlag
+- Abrechnungsvorschau mit Erstattung oder Nachzahlung
+- PV-Ersparnis als separate negative Position, ohne die tatsächlichen Stromkosten zu reduzieren
+- Wasserzähler mit manuellen, auch rückwirkenden Ablesungen
+- Zeitraums- und Vorjahresvergleich
+- Excel-Export unter Einstellungen
+- Fahrzeug-, Tank- und Betriebskostenverwaltung
 
-## Installation mit Portainer
-
-Es wird nur die Datei [`docker-compose.yml`](docker-compose.yml) benötigt.
-
-1. Portainer öffnen und **Stacks → Add stack → Web editor** wählen.
-2. Den Inhalt von `docker-compose.yml` einfügen.
-3. Mindestens `HA_URL` und `HA_TOKEN` ersetzen.
-4. Die eigenen Sensor-IDs nur lokal in den drei `HA_*_ENTITY`-Variablen ergänzen.
-5. Stack bereitstellen und `http://<AM06Pro-IP>:8090` öffnen.
-
-Die SQLite-Datenbank liegt dauerhaft im Docker-Volume `energylab_data`.
-
-## Home Assistant
-
-Die persönlichen Sensor-IDs werden nicht im Repository gespeichert. Sie werden ausschließlich lokal im Portainer-Stack eingetragen:
-
-- `HA_GRID_IMPORT_ENTITY`: fortlaufender Strombezugszähler in kWh
-- `HA_PV_SELF_ENTITY`: fortlaufender PV-Eigenverbrauchszähler in kWh
-- `HA_GAS_ENTITY`: fortlaufender Gaszähler in m³
-
-Die Anwendung liest einmal täglich den aktuellen Zählerstand. Der Tagesverbrauch entsteht aus der Differenz zum vorherigen Stand. Momentanleistungs-Sensoren in Watt sind dafür nicht geeignet.
-
-Auf der Seite **Energie** kann ein Startdatum für einen einmaligen Historienimport gewählt werden. Verfügbar sind nur Zeiträume, für die Home Assistant Langzeitstatistiken des jeweiligen Sensors gespeichert hat. Wiederholte Importe aktualisieren dieselben Tage, statt Dubletten anzulegen.
-
-Strom- und Gastarife werden mit Anbieter und Cent/kWh eingegeben. Intern rechnet EnergyLab Cent automatisch in Euro um. Beim Update werden ältere, versehentlich als Euro gespeicherte Centpreise einmalig korrigiert. Je Tarifzeitraum werden außerdem der monatliche Grundpreis und der monatliche Abschlag als Brutto-Beträge in Euro gespeichert. Die Energie-Seite zeigt Verbrauchskosten, anteiligen Grundpreis, Gesamtkosten, berücksichtigte Abschläge und daraus das voraussichtliche Guthaben oder die Nachzahlung getrennt an. Bei angebrochenen Monaten werden Grundpreis und Abschlag taggenau anteilig bis zum letzten Zählerstand berechnet.
-
-Die gespeicherten Vertragszeiträume lassen sich auf der Energie-Seite aufklappen und bearbeiten. Pro Tarifart können bis zu fünf Zeiträume hinterlegt werden. Da der Gaszähler m³ liefert, wird beim Gastarif außerdem der Umrechnungsfaktor in kWh/m³ aus der jeweiligen Gasabrechnung eingetragen. Wassertarife enthalten Anbieter, Verbrauchspreis in €/m³, Grundpreis in €/Monat und Abschlag in €/Monat. Für vollständige variable Wasserkosten kann der Verbrauchspreis aus Trinkwasser und Abwasser kombiniert werden.
-
-Der PV-Eigenverbrauch wird mit dem im jeweiligen Zeitraum gültigen Strom-Arbeitspreis bewertet. EnergyLab zeigt diesen Betrag separat und negativ als „dadurch gespart“ an. Die Ersparnis wird ausdrücklich nicht von den tatsächlichen Stromkosten abgezogen. Wasser wird ohne Home-Assistant-Sensor ausschließlich über manuelle Zählerstände mit Ablesedatum erfasst; bei rückwirkenden Ergänzungen oder Korrekturen berechnet EnergyLab alle betroffenen Verbrauchsdifferenzen neu.
-
-Beim Start und nach jedem Home-Assistant-Import berechnet EnergyLab die Differenzen fortlaufender Strom-, PV- und Gaszähler aus den gültigen Zählerständen neu. Nullwerte während eines Ausfalls, Rücksprünge und unplausibel große Sprünge werden markiert und aus Verbräuchen, Kosten, PV-Ersparnis und Diagrammen ausgeschlossen. Bei einer echten Datenlücke wird der zulässige Sprung anhand der vergangenen Tage vergrößert, damit der aufgelaufene Mehrtagesverbrauch nach der Rückkehr des Sensors erhalten bleibt. Die ursprünglichen Zählerstände werden nicht gelöscht.
-
-Für den Zugriff wird in Home Assistant unter **Profil → Sicherheit → Langlebige Zugriffstoken** ein Token erzeugt und ausschließlich lokal als `HA_TOKEN` im Portainer-Stack eingetragen.
-
-## Entwicklung
+## Start mit Docker Compose
 
 ```bash
-python -m unittest discover -s tests -v
-ENERGYLAB_DATA_DIR=./data python app.py
+docker compose up -d
 ```
 
-Das Container-Image wird nach erfolgreichen Tests automatisch als `ghcr.io/lrdtiberius/energylab:latest` veröffentlicht.
+Danach ist EnergyLab unter `http://<docker-host>:8090` erreichbar. Die SQLite-Datenbank liegt im Volume `energylab_data` und bleibt bei Image-Updates erhalten.
 
-## Unterstützung
+Die mitgelieferte `docker-compose.yml` enthält ausschließlich neutrale Platzhalter. Trage Home-Assistant-Token und Sensoren nur in deiner lokalen Installation ein und veröffentliche sie nicht.
 
-Idea und umsetztung by Lrd.Tiberius
+## Konfiguration
 
-Der Bereich **Unterstützung** enthält einen einzelnen „Buy me a coffee“-Link auf die bereits in den anderen Lab-Projekten verwendete PayPal-Me-Seite. Das Ziel bleibt über `BUY_ME_A_COFFEE_URL` konfigurierbar.
+| Variable | Bedeutung | Standard |
+|---|---|---|
+| `TZ` | Zeitzone | `Europe/Berlin` |
+| `HA_URL` | URL von Home Assistant | `http://homeassistant.local:8123` |
+| `HA_TOKEN` | langlebiger Home-Assistant-Zugriffstoken | leer |
+| `HA_GRID_IMPORT_ENTITY` | fortlaufender Strombezugszähler | leer |
+| `HA_PV_SELF_ENTITY` | fortlaufender PV-Eigenverbrauchszähler | leer |
+| `HA_GAS_ENTITY` | fortlaufender Gaszähler | leer |
+| `ENERGYLAB_SYNC_HOUR` | Stunde der täglichen Synchronisierung | `23` |
+| `ENERGYLAB_SYNC_MINUTE` | Minute der täglichen Synchronisierung | `30` |
+| `BUY_ME_A_COFFEE_URL` | Ziel des Unterstützungslinks | siehe Beispiel-Stack |
+
+## Update
+
+Baue das neue Image, ändere im Portainer-Stack den Image-Namen und aktualisiere den Stack. Das Volume `energylab_data` darf dabei nicht gelöscht werden. EnergyLab führt erforderliche Datenbankanpassungen beim Start selbst aus.
+
+## Datenschutz
+
+Das Repository enthält keine privaten Home-Assistant-Adressen, Tokens, Sensor-IDs, Zählerstände, Verbrauchsdaten, Tarife oder Vertragsdaten. Alle Nutzdaten bleiben in der lokalen SQLite-Datenbank.
+
+## Urheber und Unterstützung
+
+Idee und Umsetzung: **Lrd.Tiberius**
+
+[Buy me a coffee](https://www.paypal.com/paypalme/SebastianM207)
+
