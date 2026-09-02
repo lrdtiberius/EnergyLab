@@ -2,17 +2,18 @@
 
 EnergyLab ist ein schlankes, lokal betriebenes Dashboard für Energie-, Wasser- und Fahrzeugdaten. Die Anwendung läuft als einzelner Docker-Container, speichert ihre Daten in SQLite und kann Zählerstände aus Home Assistant übernehmen.
 
-## Release 0.6.0
+## Release 0.6.1
 
 Die Detailansichten von Strom, PV-Eigenverbrauch, Gas und Wasser lassen sich jetzt monatsweise durchblättern:
 
 - vorherige Monate direkt in der jeweiligen Energieansicht öffnen
 - bis zum aktuellen Monat wieder vorwärts navigieren
+- mit **„Zum aktuellen Monat“** aus jeder historischen Ansicht direkt zurückspringen
 - Verbrauch, Kosten, Messwerte und Diagramme passend zum gewählten Monat berechnen
 - zukünftige Monate automatisch sperren
 - Abrechnungshochrechnung nur dort anzeigen, wo sie fachlich sinnvoll ist
 
-Die Version 0.6.0 ist ein vollständiges Standalone-Release und benötigt keinen Patch sowie keine ältere Programmversion. Beim Update bleibt das vorhandene Docker-Volume erhalten.
+Die Version 0.6.1 ist ein vollständiges Standalone-Release und benötigt keinen Patch sowie keine ältere Programmversion. Beim Update bleibt das vorhandene Docker-Volume erhalten.
 
 ## Funktionen
 
@@ -67,4 +68,3 @@ Das Repository enthält keine privaten Home-Assistant-Adressen, Tokens, Sensor-I
 Idee und Umsetzung: **Lrd.Tiberius**
 
 [Buy me a coffee](https://www.paypal.com/paypalme/SebastianM207)
-
