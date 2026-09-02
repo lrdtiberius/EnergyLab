@@ -1,7 +1,7 @@
 import os
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 
@@ -115,6 +115,30 @@ class EnergyLabTests(unittest.TestCase):
         self.assertIn("Zählersprung", rows[3]["invalid_reason"])
         self.assertAlmostEqual(rows[4]["delta_value"], 2.0)
 
+    def test_detail_chart_marks_invalid_meter_values(self):
+        with app.connect() as db:
+            for read_on, total, valid, reason in (
+                ("2026-01-01", 100.0, 1, ""),
+                ("2026-01-02", 0.0, 0, "Nullwert während Sensorausfall"),
+                ("2026-01-03", 102.0, 1, ""),
+            ):
+                db.execute(
+                    """INSERT INTO energy_readings(
+                           metric,read_on,total_value,delta_value,unit,entity_id,is_valid,invalid_reason
+                       ) VALUES(?,?,?,?,?,?,?,?)""",
+                    ("gas", read_on, total, None, "m³", "sensor.example_gas", valid, reason),
+                )
+            rows = db.execute("SELECT * FROM energy_readings WHERE metric='gas' ORDER BY read_on").fetchall()
+        chart = app.detail_chart(rows, "total_value", "m³", True)
+        self.assertIn("invalid-point", chart)
+        self.assertIn("01.01.2026", chart)
+        self.assertIn("03.01.2026", chart)
+
+    def test_dashboard_metric_card_can_link_to_details(self):
+        card = app.Handler.metric_card("🔥", "Gas", 12.0, "m³", "", "/energy/gas?period=year")
+        self.assertIn('class="card metric metric-link"', card)
+        self.assertIn('href="/energy/gas?period=year"', card)
+
     def test_offline_gap_scales_plausibility_window(self):
         with app.connect() as db:
             for read_on, total in (("2026-01-01", 3600.0), ("2026-01-02", 3605.0), ("2026-01-10", 3640.0)):
@@ -174,6 +198,98 @@ class EnergyLabTests(unittest.TestCase):
         self.assertAlmostEqual(values["cost"], 44.9)
         self.assertAlmostEqual(values["advance"], 100.0)
         self.assertAlmostEqual(values["balance"], 55.1)
+
+    def test_settlement_forecast_projects_to_tariff_end(self):
+        with app.connect() as db:
+            db.execute(
+                "INSERT INTO energy_readings(metric,read_on,total_value,delta_value,unit,entity_id) VALUES(?,?,?,?,?,?)",
+                ("grid_import", "2025-01-01", 1000, None, "kWh", "sensor.example_grid"),
+            )
+            db.execute(
+                "INSERT INTO energy_readings(metric,read_on,total_value,delta_value,unit,entity_id) VALUES(?,?,?,?,?,?)",
+                ("grid_import", "2025-01-11", 1100, 100, "kWh", "sensor.example_grid"),
+            )
+            db.execute(
+                """INSERT INTO energy_tariffs(
+                       metric,provider,valid_from,valid_to,price_per_kwh,kwh_per_unit,
+                       base_fee_monthly,advance_monthly
+                   ) VALUES(?,?,?,?,?,?,?,?)""",
+                ("grid_import", "Beispiel", "2025-01-01", "2025-01-31", 0.5, 1.0, 10.0, 100.0),
+            )
+            forecast = app.settlement_forecast(db, "grid_import")
+        self.assertEqual(forecast["data_until"], "2025-01-11")
+        self.assertEqual(forecast["contract_end"], "2025-01-31")
+        self.assertAlmostEqual(forecast["daily_average"], 10.0)
+        self.assertAlmostEqual(forecast["projected"]["consumption"], 300.0)
+        self.assertAlmostEqual(forecast["projected"]["cost"], 160.0)
+        self.assertAlmostEqual(forecast["projected"]["advance"], 100.0)
+        self.assertAlmostEqual(forecast["projected"]["balance"], -60.0)
+
+    def test_settlement_forecast_requires_two_readings_and_tariff_end(self):
+        with app.connect() as db:
+            db.execute(
+                "INSERT INTO energy_readings(metric,read_on,total_value,delta_value,unit,entity_id) VALUES(?,?,?,?,?,?)",
+                ("water", "2025-01-01", 100, None, "m³", "manual"),
+            )
+            db.execute(
+                """INSERT INTO energy_tariffs(
+                       metric,provider,valid_from,valid_to,price_per_kwh,kwh_per_unit,
+                       base_fee_monthly,advance_monthly
+                   ) VALUES(?,?,?,?,?,?,?,?)""",
+                ("water", "Wasserwerk", "2025-01-01", "2025-12-31", 4.0, 1.0, 10.0, 50.0),
+            )
+            forecast = app.settlement_forecast(db, "water")
+        self.assertIn("mindestens zwei", forecast["reason"])
+
+    def test_daily_sync_is_due_at_2330_once(self):
+        self.assertFalse(app.sync_due(datetime(2026, 8, 19, 23, 29), None))
+        self.assertTrue(app.sync_due(datetime(2026, 8, 19, 23, 30), None))
+        self.assertFalse(app.sync_due(datetime(2026, 8, 19, 23, 30), "2026-08-19"))
+        self.assertTrue(app.sync_due(datetime(2026, 8, 20, 23, 30), "2026-08-19"))
+
+    def test_selected_month_bounds_and_future_clamp(self):
+        reference = date(2026, 9, 2)
+        selected = app.month_start_from_query("2025-12", reference)
+        self.assertEqual(selected, date(2025, 12, 1))
+        self.assertEqual(app.selected_month_bounds(selected), ("2025-12-01", "2025-12-31"))
+        self.assertEqual(app.shift_month(selected, 1), date(2026, 1, 1))
+        self.assertEqual(app.month_label(selected), "Dezember 2025")
+        self.assertEqual(app.month_start_from_query("2099-01", reference), date(2026, 9, 1))
+        self.assertEqual(app.month_start_from_query("ungültig", reference), date(2026, 9, 1))
+
+    def test_detail_month_navigation_uses_only_selected_source_month(self):
+        with app.connect() as db:
+            for read_on, total, delta in (
+                ("2025-08-01", 1000.0, None),
+                ("2025-08-02", 1004.0, 4.0),
+                ("2025-09-01", 1010.0, 6.0),
+            ):
+                db.execute(
+                    "INSERT INTO energy_readings(metric,read_on,total_value,delta_value,unit,entity_id) VALUES(?,?,?,?,?,?)",
+                    ("grid_import", read_on, total, delta, "kWh", "sensor.example_grid"),
+                )
+            db.execute(
+                """INSERT INTO energy_tariffs(
+                       metric,provider,valid_from,valid_to,price_per_kwh,kwh_per_unit,
+                       base_fee_monthly,advance_monthly
+                   ) VALUES(?,?,?,?,?,?,?,?)""",
+                ("grid_import", "Beispiel", "2025-01-01", "2025-12-31", 0.30, 1.0, 10.0, 50.0),
+            )
+
+        class PageCapture:
+            def send_html(self, html, *args, **kwargs):
+                self.html = html
+
+        capture = PageCapture()
+        app.Handler.energy_detail_page(capture, "grid_import", "month", "2025-08")
+        self.assertIn("August 2025", capture.html)
+        self.assertIn("month=2025-09", capture.html)
+        self.assertIn("Erster Monat mit Quelldaten", capture.html)
+        self.assertIn("4,00 kWh", capture.html)
+        self.assertIn("02.08.2025", capture.html)
+        self.assertNotIn("01.09.2025", capture.html)
+        self.assertNotIn("Voraussichtliche Erstattung", capture.html)
+        self.assertNotIn("Voraussichtliche Nachzahlung", capture.html)
 
     def test_pv_savings_use_grid_work_price_without_reducing_costs(self):
         with app.connect() as db:

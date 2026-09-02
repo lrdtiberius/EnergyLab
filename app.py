@@ -22,6 +22,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 from datetime import date, datetime, timedelta, timezone
 from email import policy
 from email.parser import BytesParser
@@ -32,7 +33,7 @@ from socketserver import ThreadingMixIn
 
 
 APP_NAME = "EnergieLab"
-APP_VERSION = "0.3.1"
+APP_VERSION = "0.6.0"
 DATA_DIR = Path(os.getenv("ENERGYLAB_DATA_DIR", "/data"))
 DB_PATH = DATA_DIR / "energylab.sqlite3"
 HOST = os.getenv("ENERGYLAB_HOST", "0.0.0.0")
@@ -43,6 +44,9 @@ HA_TOKEN = os.getenv("HA_TOKEN", "").strip()
 COFFEE_URL = os.getenv("BUY_ME_A_COFFEE_URL", "").strip()
 MAX_UPLOAD = 5 * 1024 * 1024
 TARIFF_LIMIT = 5
+SYNC_HOUR = int(os.getenv("ENERGYLAB_SYNC_HOUR", "23"))
+SYNC_MINUTE = int(os.getenv("ENERGYLAB_SYNC_MINUTE", "30"))
+MAX_PERIOD_CROSSING_GAP_DAYS = int(os.getenv("ENERGYLAB_MAX_PERIOD_CROSSING_GAP_DAYS", "62"))
 
 # Generous household safety limits. Gaps are multiplied by their day count.
 MAX_DAILY_CHANGE = {
@@ -81,6 +85,15 @@ METRICS = {
 
 FLUIDS = ("Diesel", "Benzin", "E10", "Super Plus", "AdBlue", "LPG", "CNG", "Strom")
 FILL_TYPES = {"first": "Erste Tankung", "full": "Volltankung", "partial": "Teiltankung"}
+VEHICLE_COST_CATEGORIES = (
+    "Versicherung",
+    "Kfz-Steuer",
+    "Reparatur / Wartung",
+    "Reifen",
+    "Hauptuntersuchung",
+    "Parken / Maut",
+    "Sonstiges",
+)
 
 
 def esc(value) -> str:
@@ -96,6 +109,22 @@ def fmt_num(value, digits=2) -> str:
 
 def fmt_money(value) -> str:
     return f"{fmt_num(value, 2)} €" if value is not None else "–"
+
+
+def comparison_difference(value_a, value_b):
+    """Describe how period B changed compared with period A."""
+    value_a = float(value_a or 0.0)
+    value_b = float(value_b or 0.0)
+    difference = value_b - value_a
+    if math.isclose(difference, 0.0, abs_tol=1e-9):
+        return {"difference": 0.0, "percent": 0.0, "label": "gleich", "css": "same"}
+    percent = None if math.isclose(value_a, 0.0, abs_tol=1e-9) else difference / value_a * 100.0
+    return {
+        "difference": difference,
+        "percent": percent,
+        "label": "mehr" if difference > 0 else "weniger",
+        "css": "more" if difference > 0 else "less",
+    }
 
 
 def parse_num(value, default=None):
@@ -170,6 +199,18 @@ def init_db() -> None:
                 WHERE external_key IS NOT NULL;
             CREATE INDEX IF NOT EXISTS idx_fuelings_vehicle_date
                 ON fuelings(vehicle_id, fueled_on, odometer);
+            CREATE TABLE IF NOT EXISTS vehicle_expenses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                vehicle_id INTEGER NOT NULL REFERENCES vehicles(id) ON DELETE CASCADE,
+                incurred_on TEXT NOT NULL,
+                category TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                amount REAL NOT NULL CHECK(amount >= 0),
+                note TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_vehicle_expenses_vehicle_date
+                ON vehicle_expenses(vehicle_id, incurred_on);
             CREATE TABLE IF NOT EXISTS energy_readings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 metric TEXT NOT NULL,
@@ -269,13 +310,60 @@ def csrf_for(_token=None) -> str:
     return b64u(hmac.new(get_secret(), b"csrf:local-forms", hashlib.sha256).digest())
 
 
-def period_bounds(period: str):
-    today = date.today()
+def period_bounds(period: str, reference: date | None = None):
+    """Return inclusive date bounds for a dashboard period."""
+    today = reference or date.today()
     if period == "year":
-        return date(today.year, 1, 1).isoformat(), None
+        return date(today.year, 1, 1).isoformat(), date(today.year, 12, 31).isoformat()
     if period == "all":
         return None, None
-    return date(today.year, today.month, 1).isoformat(), None
+    if period == "month":
+        start = date(today.year, today.month, 1)
+        next_month = date(today.year + 1, 1, 1) if today.month == 12 else date(today.year, today.month + 1, 1)
+        return start.isoformat(), (next_month - timedelta(days=1)).isoformat()
+    raise ValueError("Unbekannter Zeitraum.")
+
+
+MONTH_NAMES_DE = (
+    "",
+    "Januar",
+    "Februar",
+    "März",
+    "April",
+    "Mai",
+    "Juni",
+    "Juli",
+    "August",
+    "September",
+    "Oktober",
+    "November",
+    "Dezember",
+)
+
+
+def month_start_from_query(value: str | None, reference: date | None = None) -> date:
+    """Resolve YYYY-MM for the detail view and never allow a future month."""
+    today = reference or date.today()
+    current_month = date(today.year, today.month, 1)
+    try:
+        selected = datetime.strptime(str(value or ""), "%Y-%m").date().replace(day=1)
+    except ValueError:
+        selected = current_month
+    return min(selected, current_month)
+
+
+def shift_month(month_start: date, offset: int) -> date:
+    """Move a first-of-month date by an arbitrary number of calendar months."""
+    absolute = month_start.year * 12 + month_start.month - 1 + offset
+    return date(absolute // 12, absolute % 12 + 1, 1)
+
+
+def selected_month_bounds(month_start: date) -> tuple[str, str]:
+    return month_start.isoformat(), (shift_month(month_start, 1) - timedelta(days=1)).isoformat()
+
+
+def month_label(month_start: date) -> str:
+    return f"{MONTH_NAMES_DE[month_start.month]} {month_start.year}"
 
 
 def upgrade_tariff_table_for_water(db) -> None:
@@ -388,95 +476,309 @@ def prorated_months(start_on: str, end_on: str) -> float:
     return total
 
 
-def energy_finances(db, start_on=None):
-    where = "AND e.read_on>=?" if start_on else ""
-    args = (start_on,) if start_on else ()
-    rows = db.execute(
-        f"""SELECT e.metric,
-                   SUM(e.delta_value * t.kwh_per_unit * t.price_per_kwh) AS cost
-            FROM energy_readings e
-            JOIN energy_tariffs t ON t.metric=e.metric
-             AND e.read_on>=t.valid_from
-             AND (t.valid_to IS NULL OR e.read_on<=t.valid_to)
-            WHERE e.delta_value IS NOT NULL AND e.is_valid=1 {where}
-            GROUP BY e.metric""",
-        args,
+def settlement_values(variable=0.0, base_fee=0.0, advance=0.0):
+    """Single source of truth for every settlement shown or exported."""
+    variable = float(variable or 0.0)
+    base_fee = float(base_fee or 0.0)
+    advance = float(advance or 0.0)
+    cost = variable + base_fee
+    return {
+        "variable": variable,
+        "base_fee": base_fee,
+        "cost": cost,
+        "advance": advance,
+        "balance": advance - cost,
+    }
+
+
+def allocated_usage(db, metric, start_on=None, end_on=None, tariff_metric=None):
+    """Split short intervals by day, but never estimate long gaps across a period boundary."""
+    readings = db.execute(
+        """SELECT read_on,delta_value FROM energy_readings
+           WHERE metric=? AND is_valid=1 ORDER BY read_on,id""",
+        (metric,),
     ).fetchall()
-    result = {
-        row["metric"]: {
-            "variable": row["cost"] or 0.0,
-            "base_fee": 0.0,
-            "cost": row["cost"] or 0.0,
-            "advance": 0.0,
-            "balance": -(row["cost"] or 0.0),
-        }
-        for row in rows
-    }
-    latest = {
-        row["metric"]: row["latest_on"]
-        for row in db.execute("SELECT metric,MAX(read_on) latest_on FROM energy_readings WHERE is_valid=1 GROUP BY metric")
-    }
+    tariffs = db.execute(
+        "SELECT * FROM energy_tariffs WHERE metric=? ORDER BY valid_from,id",
+        (tariff_metric or metric,),
+    ).fetchall()
+    range_start = date.fromisoformat(start_on) if start_on else None
+    range_end = date.fromisoformat(end_on) if end_on else None
+    previous_day = None
+    consumption = 0.0
+    variable_cost = 0.0
+    for reading in readings:
+        current_day = date.fromisoformat(reading["read_on"])
+        delta = reading["delta_value"]
+        if delta is not None:
+            interval_start = previous_day + timedelta(days=1) if previous_day else current_day
+            interval_days = max(1, (current_day - interval_start).days + 1)
+            daily_usage = float(delta) / interval_days
+            crosses_uncertain_report_boundary = bool(
+                range_start
+                and interval_days > MAX_PERIOD_CROSSING_GAP_DAYS
+                and interval_start < range_start <= current_day
+            )
+            cursor = interval_start
+            while cursor <= current_day:
+                if (range_start is None or cursor >= range_start) and (range_end is None or cursor <= range_end):
+                    cursor_iso = cursor.isoformat()
+                    tariff = next((item for item in tariffs if item["valid_from"] <= cursor_iso and (not item["valid_to"] or cursor_iso <= item["valid_to"])), None)
+                    if not crosses_uncertain_report_boundary:
+                        consumption += daily_usage
+                    crosses_uncertain_tariff_boundary = bool(
+                        tariff
+                        and interval_days > MAX_PERIOD_CROSSING_GAP_DAYS
+                        and interval_start < date.fromisoformat(tariff["valid_from"]) <= current_day
+                    )
+                    if tariff and not crosses_uncertain_report_boundary and not crosses_uncertain_tariff_boundary:
+                        variable_cost += daily_usage * float(tariff["kwh_per_unit"]) * float(tariff["price_per_kwh"])
+                cursor += timedelta(days=1)
+        previous_day = current_day
+    return consumption, variable_cost
+
+
+def energy_finances(db, start_on=None, end_on=None):
+    result = {}
+    for metric in ("grid_import", "gas", "water"):
+        _consumption, variable = allocated_usage(db, metric, start_on, end_on)
+        result[metric] = settlement_values(variable=variable)
     for tariff in db.execute("SELECT * FROM energy_tariffs ORDER BY valid_from,id"):
         metric = tariff["metric"]
-        if metric not in result or metric not in latest:
-            continue
         period_start = max(value for value in (tariff["valid_from"], start_on) if value)
-        period_end = min(value for value in (tariff["valid_to"], latest[metric]) if value)
+        candidates = [value for value in (tariff["valid_to"], end_on, date.today().isoformat()) if value]
+        period_end = min(candidates)
+        if period_end < period_start:
+            continue
         months = prorated_months(period_start, period_end)
+        result.setdefault(metric, settlement_values())
         result[metric]["base_fee"] += months * tariff["base_fee_monthly"]
         result[metric]["advance"] += months * tariff["advance_monthly"]
-    for values in result.values():
-        values["cost"] = values["variable"] + values["base_fee"]
-        values["balance"] = values["advance"] - values["cost"]
+    for metric, values in tuple(result.items()):
+        result[metric] = settlement_values(values["variable"], values["base_fee"], values["advance"])
     return result
 
 
-def energy_costs(db, start_on=None):
-    return {metric: values["cost"] for metric, values in energy_finances(db, start_on).items()}
+def energy_costs(db, start_on=None, end_on=None):
+    return {metric: values["cost"] for metric, values in energy_finances(db, start_on, end_on).items()}
 
 
-def pv_savings(db, start_on=None):
-    """Value PV self-consumption at the applicable grid work price without offsetting costs."""
-    where = "AND e.read_on>=?" if start_on else ""
-    args = (start_on,) if start_on else ()
-    row = db.execute(
-        f"""SELECT SUM(e.delta_value * t.price_per_kwh) AS savings
-            FROM energy_readings e
-            JOIN energy_tariffs t ON t.metric='grid_import'
-             AND e.read_on>=t.valid_from
-             AND (t.valid_to IS NULL OR e.read_on<=t.valid_to)
-            WHERE e.metric='pv_self' AND e.delta_value IS NOT NULL AND e.is_valid=1 {where}""",
-        args,
+def settlement_forecast(db, metric: str):
+    """Project the active contract from valid readings through its end date."""
+    if metric not in ("grid_import", "gas", "water"):
+        return None
+    latest = db.execute(
+        "SELECT read_on FROM energy_readings WHERE metric=? AND is_valid=1 ORDER BY read_on DESC LIMIT 1",
+        (metric,),
     ).fetchone()
-    return row["savings"] if row and row["savings"] is not None else None
+    if not latest:
+        return {"reason": "Noch kein gültiger Zählerstand vorhanden."}
+    latest_on = latest["read_on"]
+    tariff = db.execute(
+        """SELECT * FROM energy_tariffs
+           WHERE metric=? AND valid_from<=?
+             AND (valid_to IS NULL OR valid_to>=?)
+           ORDER BY valid_from DESC,id DESC LIMIT 1""",
+        (metric, latest_on, latest_on),
+    ).fetchone()
+    if not tariff:
+        return {"reason": "Für den letzten Zählerstand ist kein Tarif hinterlegt."}
+    if not tariff["valid_to"]:
+        return {"reason": "Bitte beim aktuellen Tarif ein Enddatum hinterlegen."}
+
+    contract_start = date.fromisoformat(tariff["valid_from"])
+    contract_end = date.fromisoformat(tariff["valid_to"])
+    latest_day = date.fromisoformat(latest_on)
+    consumption, current_variable = allocated_usage(db, metric, tariff["valid_from"], latest_on)
+    if consumption <= 0:
+        return {
+            "reason": "Für die Hochrechnung werden mindestens zwei gültige Zählerstände benötigt.",
+            "provider": tariff["provider"],
+            "contract_end": tariff["valid_to"],
+        }
+    first_reading = db.execute(
+        """SELECT read_on FROM energy_readings
+           WHERE metric=? AND is_valid=1 AND read_on<=?
+           ORDER BY read_on,id LIMIT 1""",
+        (metric, latest_on),
+    ).fetchone()
+    observed_start = max(contract_start, date.fromisoformat(first_reading["read_on"]))
+    observed_days = max(1, (latest_day - observed_start).days)
+    daily_average = consumption / observed_days
+    remaining_days = max(0, (contract_end - latest_day).days)
+    price_per_unit = float(tariff["price_per_kwh"]) * float(tariff["kwh_per_unit"])
+
+    current_base = prorated_months(tariff["valid_from"], latest_on) * float(tariff["base_fee_monthly"])
+    current_advance = prorated_months(tariff["valid_from"], latest_on) * float(tariff["advance_monthly"])
+
+    projected_consumption = consumption + daily_average * remaining_days
+    projected_variable = projected_consumption * price_per_unit
+    projected_base = prorated_months(tariff["valid_from"], tariff["valid_to"]) * float(tariff["base_fee_monthly"])
+    projected_advance = prorated_months(tariff["valid_from"], tariff["valid_to"]) * float(tariff["advance_monthly"])
+    current = settlement_values(current_variable, current_base, current_advance)
+    projected = settlement_values(projected_variable, projected_base, projected_advance)
+    current["consumption"] = consumption
+    projected["consumption"] = projected_consumption
+    return {
+        "provider": tariff["provider"],
+        "contract_start": tariff["valid_from"],
+        "contract_end": tariff["valid_to"],
+        "data_until": latest_on,
+        "observed_days": observed_days,
+        "daily_average": daily_average,
+        "current": current,
+        "projected": projected,
+    }
 
 
-def save_manual_water_reading(read_on, total_value):
+def pv_savings(db, start_on=None, end_on=None):
+    """Value PV self-consumption at the applicable grid work price without offsetting costs."""
+    consumption, savings = allocated_usage(db, "pv_self", start_on, end_on, "grid_import")
+    return savings if consumption else None
+
+
+def personallab_payload():
+    """Expose EnergyLab's own calculations as a read-only PersonalLab API."""
+    today = date.today()
+    today_text = today.isoformat()
+    month_start = date(today.year, today.month, 1).isoformat()
+    year_start = date(today.year, 1, 1).isoformat()
+    specs = (
+        ("electricity", "grid_import", "Strom", "kWh"),
+        ("water", "water", "Wasser", "m³"),
+        ("gas", "gas", "Gas", "m³"),
+        ("pv", "pv_self", "Photovoltaik", "kWh"),
+    )
+
+    def finance_values(values):
+        if not values:
+            return None
+        return {
+            "variable": values.get("variable"),
+            "baseFee": values.get("base_fee"),
+            "cost": values.get("cost"),
+            "advance": values.get("advance"),
+            "balance": values.get("balance"),
+        }
+
+    with connect() as db:
+        month_finances = energy_finances(db, month_start, today_text)
+        year_finances = energy_finances(db, year_start, today_text)
+        tariffs = [dict(row) for row in db.execute(
+            "SELECT * FROM energy_tariffs ORDER BY valid_from DESC,id DESC"
+        )]
+        segments = []
+        for segment_id, metric, label, unit in specs:
+            history = [{
+                "id": row["id"], "date": row["read_on"],
+                "total": row["total_value"], "delta": row["delta_value"],
+                "unit": row["unit"], "source": row["source"],
+            } for row in db.execute(
+                """SELECT id,read_on,total_value,delta_value,unit,source
+                   FROM energy_readings WHERE metric=? AND is_valid=1
+                   ORDER BY read_on DESC,id DESC LIMIT 120""", (metric,)
+            )]
+            tariff_metric = "grid_import" if metric == "pv_self" else metric
+            contracts = []
+            for row in (item for item in tariffs if item["metric"] == tariff_metric):
+                contracts.append({
+                    "id": row["id"], "provider": row["provider"],
+                    "validFrom": row["valid_from"], "validTo": row["valid_to"],
+                    "unitPrice": row["price_per_kwh"],
+                    "unitPriceLabel": (
+                        f"{row['price_per_kwh'] * 100:.2f} Cent/kWh"
+                        if tariff_metric in ("grid_import", "gas")
+                        else f"{row['price_per_kwh']:.4f} €/m³"
+                    ).replace(".", ","),
+                    "baseFeeMonthly": row["base_fee_monthly"],
+                    "advanceMonthly": row["advance_monthly"],
+                    "active": row["valid_from"] <= today_text and (
+                        not row["valid_to"] or row["valid_to"] >= today_text
+                    ),
+                })
+            forecast = settlement_forecast(db, tariff_metric) if metric != "pv_self" else None
+            projected = forecast.get("projected") if forecast else None
+            invalid = db.execute(
+                "SELECT COUNT(*) count FROM energy_readings WHERE metric=? AND is_valid=0",
+                (metric,),
+            ).fetchone()["count"]
+            segments.append({
+                "id": segment_id, "metric": metric, "label": label, "unit": unit,
+                "latest": history[0] if history else None,
+                "consumption": {
+                    "month": allocated_usage(db, metric, month_start, today_text, tariff_metric)[0],
+                    "year": allocated_usage(db, metric, year_start, today_text, tariff_metric)[0],
+                    "total": allocated_usage(db, metric, None, today_text, tariff_metric)[0],
+                },
+                "finances": {
+                    "month": finance_values(month_finances.get(tariff_metric)) if metric != "pv_self" else None,
+                    "year": finance_values(year_finances.get(tariff_metric)) if metric != "pv_self" else None,
+                },
+                "forecast": ({
+                    "through": forecast.get("contract_end"),
+                    "cost": projected.get("cost"),
+                    "advance": projected.get("advance"),
+                    "balance": projected.get("balance"),
+                } if projected else None),
+                "savings": {
+                    "month": pv_savings(db, month_start, today_text) if metric == "pv_self" else None,
+                    "year": pv_savings(db, year_start, today_text) if metric == "pv_self" else None,
+                },
+                "contracts": contracts, "history": history,
+                "invalidCount": int(invalid or 0),
+            })
+    return {
+        "version": "1", "source": {"app": APP_NAME, "version": APP_VERSION},
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "period": {"monthStart": month_start, "yearStart": year_start},
+        "segments": segments,
+    }
+
+
+def save_manual_energy_reading(metric, read_on, total_value):
+    if metric not in ("grid_import", "gas", "water"):
+        raise ValueError("Diese Messgröße unterstützt keine manuelle Zählerstandseingabe.")
     read_on = parse_iso_date(read_on)
     total_value = parse_num(total_value)
+    label = METRICS[metric]["label"]
+    unit = METRICS[metric]["unit"]
     if not read_on or read_on > date.today().isoformat() or total_value is None or total_value < 0:
-        raise ValueError("Bitte ein gültiges Datum bis heute und einen nichtnegativen Wasserzählerstand eingeben.")
+        raise ValueError(f"Bitte ein gültiges Datum bis heute und einen nichtnegativen {label}-Zählerstand eingeben.")
     with connect() as db:
         db.execute(
             """INSERT INTO energy_readings(metric,read_on,total_value,delta_value,unit,entity_id,source,is_valid,invalid_reason)
-               VALUES('water',?,?,NULL,'m³','manual','manual',1,'')
+               VALUES(?,?,?,NULL,?,'manual','manual',1,'')
                ON CONFLICT(metric,read_on) DO UPDATE SET
                  total_value=excluded.total_value,source='manual',entity_id='manual',
-                 unit='m³',is_valid=1,invalid_reason='',created_at=CURRENT_TIMESTAMP""",
-            (read_on, total_value),
+                 unit=excluded.unit,is_valid=1,invalid_reason='',created_at=CURRENT_TIMESTAMP""",
+            (metric, read_on, total_value, unit),
         )
         rows = db.execute(
-            "SELECT id,total_value FROM energy_readings WHERE metric='water' ORDER BY read_on,id"
+            "SELECT id,read_on,total_value FROM energy_readings WHERE metric=? AND is_valid=1 ORDER BY read_on,id",
+            (metric,),
         ).fetchall()
         previous = None
         for row in rows:
             current = row["total_value"]
             if previous is not None and current < previous:
-                raise ValueError("Der Wasserzählerstand darf gegenüber der vorherigen Eingabe nicht sinken.")
+                raise ValueError(f"Der {label}-Zählerstand liegt nicht zwischen dem vorherigen und dem nachfolgenden Stand.")
             delta = None if previous is None else current - previous
             db.execute("UPDATE energy_readings SET delta_value=? WHERE id=?", (delta, row["id"]))
             previous = current
+        if metric in MAX_DAILY_CHANGE:
+            sanitize_cumulative_readings(db, metric)
+            inserted = db.execute(
+                "SELECT is_valid,invalid_reason FROM energy_readings WHERE metric=? AND read_on=?",
+                (metric, read_on),
+            ).fetchone()
+            if not inserted["is_valid"]:
+                raise ValueError(f"Der eingegebene {label}-Stand wurde als unplausibel erkannt: {inserted['invalid_reason']}.")
     return read_on, total_value
+
+
+def save_manual_water_reading(read_on, total_value):
+    """Compatibility wrapper for existing integrations and tests."""
+    return save_manual_energy_reading("water", read_on, total_value)
 
 
 def tariff_price_to_eur(metric: str, value):
@@ -526,27 +828,68 @@ def consumption_summary(db, vehicle_id: int, fluid="Diesel"):
     ).fetchall()
     previous_full = None
     liters_since_full = 0.0
+    cost_since_full = 0.0
     cycles = []
     row_values = {}
+    row_costs = {}
     for row in rows:
         if previous_full is None:
             if row["fill_type"] in ("first", "full"):
                 previous_full = row["odometer"]
                 liters_since_full = 0.0
+                cost_since_full = 0.0
             continue
         liters_since_full += row["liters"]
+        cost_since_full += row["total_price"]
         if row["fill_type"] == "full":
             distance = row["odometer"] - previous_full
             if distance > 0:
                 value = liters_since_full / distance * 100
-                cycles.append((distance, liters_since_full, value))
+                cost_per_km = cost_since_full / distance
+                cycles.append((distance, liters_since_full, value, cost_since_full, cost_per_km))
                 row_values[row["id"]] = value
+                row_costs[row["id"]] = cost_per_km
             previous_full = row["odometer"]
             liters_since_full = 0.0
+            cost_since_full = 0.0
     total_distance = sum(c[0] for c in cycles)
     total_liters = sum(c[1] for c in cycles)
+    total_cost = sum(c[3] for c in cycles)
     average = total_liters / total_distance * 100 if total_distance else None
-    return {"average": average, "distance": total_distance, "liters": total_liters, "cycles": cycles, "rows": row_values}
+    cost_per_km = total_cost / total_distance if total_distance else None
+    return {"average": average, "cost_per_km": cost_per_km, "distance": total_distance, "liters": total_liters, "cost": total_cost, "cycles": cycles, "rows": row_values, "row_costs": row_costs}
+
+
+def vehicle_cost_summary(db, vehicle_id: int):
+    """Calculate lifetime vehicle costs over all odometer-backed driven kilometres."""
+    fuel = db.execute(
+        """SELECT COALESCE(SUM(total_price),0) fuel_cost,
+                  MIN(odometer) first_odometer,MAX(odometer) last_odometer,
+                  MIN(fueled_on) first_date,MAX(fueled_on) last_date
+           FROM fuelings WHERE vehicle_id=?""",
+        (vehicle_id,),
+    ).fetchone()
+    extra_cost = db.execute(
+        "SELECT COALESCE(SUM(amount),0) cost FROM vehicle_expenses WHERE vehicle_id=?",
+        (vehicle_id,),
+    ).fetchone()["cost"]
+    first_odometer = fuel["first_odometer"]
+    last_odometer = fuel["last_odometer"]
+    distance = last_odometer - first_odometer if first_odometer is not None and last_odometer is not None else 0.0
+    fuel_cost = float(fuel["fuel_cost"] or 0.0)
+    extra_cost = float(extra_cost or 0.0)
+    total_cost = fuel_cost + extra_cost
+    return {
+        "distance": distance,
+        "fuel_cost": fuel_cost,
+        "extra_cost": extra_cost,
+        "total_cost": total_cost,
+        "cost_per_km": total_cost / distance if distance > 0 else None,
+        "first_odometer": first_odometer,
+        "last_odometer": last_odometer,
+        "first_date": fuel["first_date"],
+        "last_date": fuel["last_date"],
+    }
 
 
 def adblue_summary(db, vehicle_id: int):
@@ -900,12 +1243,17 @@ def sync_home_assistant():
     return messages
 
 
+def sync_due(now: datetime, last_attempt: str | None) -> bool:
+    today = now.date().isoformat()
+    return last_attempt != today and (now.hour, now.minute) >= (SYNC_HOUR, SYNC_MINUTE)
+
+
 def sync_scheduler():
     last_attempt = None
     while True:
         now = datetime.now()
         today = now.date().isoformat()
-        if ha_ready() and now.hour >= 0 and now.minute >= 10 and last_attempt != today:
+        if ha_ready() and sync_due(now, last_attempt):
             try:
                 sync_home_assistant()
             except Exception as exc:
@@ -929,6 +1277,17 @@ details.tariff-history summary:after{content:"▾";color:var(--blue);transition:
 details.tariff-history[open] summary:after{transform:rotate(180deg)}
 details.tariff-history .details-body{padding:0 20px 20px}
 button:disabled{opacity:.45;cursor:not-allowed;filter:none}
+.settlement-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}
+.settlement-card h3{margin:0;font-size:18px}.settlement-card .contract{color:var(--muted);font-size:12px;margin:3px 0 16px}
+.settlement-block{border-top:1px solid var(--line);padding-top:12px;margin-top:12px}.settlement-block:first-of-type{border-top:0;padding-top:0}
+.settlement-block .row{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-top:6px}
+.settlement-block .amount{font-size:20px;font-weight:800}.settlement-block .amount.ok{color:var(--green)}.settlement-block .amount.warn{color:#ffb0b0}
+.metric-link{display:block;color:var(--text);transition:transform .16s ease,border-color .16s ease}.metric-link:hover{transform:translateY(-2px);border-color:var(--blue);text-decoration:none}
+.detail-chart{width:100%;min-width:620px;height:280px;display:block}.chart-grid line{stroke:var(--line);stroke-width:1}.chart-grid text,.axis-label{fill:var(--muted);font-size:12px}.chart-line polyline{fill:none;stroke:var(--cyan);stroke-width:3;stroke-linecap:round;stroke-linejoin:round}.invalid-point{fill:var(--red);stroke:#ffd4d4;stroke-width:2}.chart-legend{display:flex;gap:18px;flex-wrap:wrap;color:var(--muted);font-size:12px}.legend-line:before{content:"";display:inline-block;width:24px;border-top:3px solid var(--cyan);vertical-align:middle;margin-right:7px}.legend-invalid:before{content:"";display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--red);margin-right:7px}
+.summary-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px}.summary-box{background:#111820;border:1px solid var(--line);border-radius:13px;padding:14px}.summary-box .value{font-size:22px;font-weight:800;margin-top:5px}.summary-box .value.ok{color:var(--green)}.summary-box .value.warn{color:#ffb0b0}.reading-invalid td{background:rgba(255,107,107,.06);color:#ffc8cc}
+.month-nav{display:grid;grid-template-columns:46px minmax(180px,280px) 46px;align-items:center;justify-content:center;gap:12px;margin:-8px 0 22px}.month-nav .month-title{text-align:center}.month-nav .month-title strong{display:block;font-size:19px}.month-arrow{width:46px;height:42px;border-radius:11px;display:grid;place-items:center;background:var(--panel2);border:1px solid var(--line);color:var(--text);font-size:25px;line-height:1}.month-arrow:hover{border-color:var(--blue);text-decoration:none}.month-arrow.disabled{opacity:.35;cursor:not-allowed}
+.comparison-delta{font-weight:800}.comparison-delta.more{color:var(--orange)}.comparison-delta.less{color:var(--green)}.comparison-delta.same{color:var(--muted)}.comparison-percent{display:block;font-size:12px;font-weight:600;margin-top:2px}
+@media(max-width:1000px){.settlement-grid{grid-template-columns:1fr}}
 """
 
 
@@ -936,8 +1295,11 @@ def page(title, body, active="", notice="", warning=False):
     items = [
         ("/", "Dashboard", "⌂"),
         ("/energy", "Energie", "⚡"),
+        ("/compare", "Vergleich", "⇄"),
+        ("/settings", "Einstellungen", "⚙"),
         ("/vehicles", "Fahrzeuge", "🚐"),
         ("/fuelings", "Tankungen", "⛽"),
+        ("/vehicle-costs", "Fahrzeugkosten", "€"),
         ("/import", "Import", "⇩"),
         ("/support", "Unterstützung", "♥"),
     ]
@@ -958,6 +1320,119 @@ def sparkline(db, metric, days=30):
     span = hi - lo or 1
     points = " ".join(f"{i * 100/(len(values)-1):.1f},{72-(v-lo)/span*60:.1f}" for i, v in enumerate(values))
     return f'<svg class="spark" viewBox="0 0 100 80" preserveAspectRatio="none"><polyline points="{points}"/></svg>'
+
+
+def detail_chart(rows, field: str, unit: str, show_invalid=False):
+    """Render a dependency-free time-series chart and expose invalid meter points."""
+    prepared = []
+    for row in rows:
+        value = row[field]
+        if value is None:
+            prepared.append((date.fromisoformat(row["read_on"]), None, bool(row["is_valid"])))
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            number = math.nan
+        prepared.append((date.fromisoformat(row["read_on"]), number if math.isfinite(number) else None, bool(row["is_valid"])))
+    plotted = [(day, value, valid) for day, value, valid in prepared if value is not None and (valid or show_invalid)]
+    valid_values = [value for _, value, valid in plotted if valid]
+    scale_values = [value for _, value, _ in plotted] if show_invalid else valid_values
+    if len(valid_values) < 2 or not scale_values:
+        return '<div class="empty">Für dieses Diagramm werden mindestens zwei gültige Werte benötigt.</div>'
+
+    first_day = min(day for day, _, _ in plotted)
+    last_day = max(day for day, _, _ in plotted)
+    day_span = max(1, (last_day - first_day).days)
+    low, high = min(scale_values), max(scale_values)
+    padding = (high - low) * 0.08 or max(abs(high) * 0.02, 1.0)
+    low -= padding
+    high += padding
+    value_span = high - low or 1.0
+    left, right, top, bottom = 72.0, 980.0, 18.0, 222.0
+
+    def point(day, value):
+        x = left + ((day - first_day).days / day_span) * (right - left)
+        y = bottom - ((value - low) / value_span) * (bottom - top)
+        return x, y
+
+    grid = []
+    for idx in range(5):
+        ratio = idx / 4
+        y = top + ratio * (bottom - top)
+        value = high - ratio * value_span
+        grid.append(f'<line x1="{left}" y1="{y:.1f}" x2="{right}" y2="{y:.1f}"/><text x="{left-10}" y="{y+4:.1f}" text-anchor="end">{fmt_num(value)}</text>')
+
+    segments = []
+    current = []
+    invalid_points = []
+    for day, value, valid in prepared:
+        if value is None or not valid:
+            if current:
+                segments.append(current)
+                current = []
+            if show_invalid and value is not None:
+                invalid_points.append(point(day, value))
+            continue
+        current.append(point(day, value))
+    if current:
+        segments.append(current)
+    lines = "".join(
+        '<polyline points="' + " ".join(f"{x:.1f},{y:.1f}" for x, y in segment) + '"/>'
+        for segment in segments if len(segment) >= 2
+    )
+    dots = "".join(f'<circle class="invalid-point" cx="{x:.1f}" cy="{y:.1f}" r="5"/>' for x, y in invalid_points)
+    return f'''<svg class="detail-chart" viewBox="0 0 1000 260" role="img" aria-label="Verlauf in {esc(unit)}"><g class="chart-grid">{"".join(grid)}</g><g class="chart-line">{lines}</g>{dots}<text class="axis-label" x="{left}" y="250">{first_day.strftime("%d.%m.%Y")}</text><text class="axis-label" x="{right}" y="250" text-anchor="end">{last_day.strftime("%d.%m.%Y")}</text><text class="axis-label" x="12" y="14">{esc(unit)}</text></svg>'''
+
+
+def build_xlsx(sheets):
+    """Create a small standards-compliant XLSX using only the Python standard library."""
+    def col_name(number):
+        name = ""
+        while number:
+            number, remainder = divmod(number - 1, 26)
+            name = chr(65 + remainder) + name
+        return name
+
+    def sheet_xml(rows):
+        xml_rows = []
+        for row_number, row in enumerate(rows, 1):
+            cells = []
+            for column_number, value in enumerate(row, 1):
+                ref = f"{col_name(column_number)}{row_number}"
+                if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                    cells.append(f'<c r="{ref}"><v>{value}</v></c>')
+                else:
+                    cells.append(f'<c r="{ref}" t="inlineStr"><is><t>{esc(value)}</t></is></c>')
+            xml_rows.append(f'<row r="{row_number}">{"".join(cells)}</row>')
+        return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' \
+               '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">' \
+               '<sheetData>' + "".join(xml_rows) + '</sheetData></worksheet>'
+
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", '<?xml version="1.0" encoding="UTF-8"?>'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+            '<Default Extension="xml" ContentType="application/xml"/>'
+            '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>' +
+            "".join(f'<Override PartName="/xl/worksheets/sheet{i}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' for i in range(1, len(sheets) + 1)) +
+            '</Types>')
+        archive.writestr("_rels/.rels", '<?xml version="1.0" encoding="UTF-8"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+            '</Relationships>')
+        archive.writestr("xl/workbook.xml", '<?xml version="1.0" encoding="UTF-8"?>'
+            '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>' +
+            "".join(f'<sheet name="{esc(name)}" sheetId="{i}" r:id="rId{i}"/>' for i, (name, _) in enumerate(sheets, 1)) +
+            '</sheets></workbook>')
+        archive.writestr("xl/_rels/workbook.xml.rels", '<?xml version="1.0" encoding="UTF-8"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+            "".join(f'<Relationship Id="rId{i}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{i}.xml"/>' for i in range(1, len(sheets) + 1)) +
+            '</Relationships>')
+        for index, (_, rows) in enumerate(sheets, 1):
+            archive.writestr(f"xl/worksheets/sheet{index}.xml", sheet_xml(rows))
+    return output.getvalue()
 
 
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
@@ -1034,6 +1509,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/health":
             self.send_bytes(json.dumps({"status": "ok", "version": APP_VERSION}).encode(), "application/json")
             return
+        if path == "/api/personallab":
+            payload = json.dumps(personallab_payload(), ensure_ascii=False).encode("utf-8")
+            self.send_bytes(payload, "application/json; charset=utf-8")
+            return
         if path in ("/login", "/logout"):
             self.redirect("/")
             return
@@ -1042,6 +1521,16 @@ class Handler(BaseHTTPRequestHandler):
             self.dashboard(query.get("period", ["month"])[0], notice)
         elif path == "/energy":
             self.energy_page(notice)
+        elif path == "/compare":
+            self.compare_page(query)
+        elif path == "/settings":
+            self.settings_page(notice)
+        elif path in {f"/energy/{metric}" for metric in METRICS}:
+            self.energy_detail_page(
+                path.split("/")[-1],
+                query.get("period", ["year"])[0],
+                query.get("month", [""])[0],
+            )
         elif path.startswith("/energy/tariffs/") and path.endswith("/edit"):
             self.energy_tariff_edit_page(int(path.split("/")[3]), notice)
         elif path == "/vehicles":
@@ -1054,6 +1543,8 @@ class Handler(BaseHTTPRequestHandler):
             self.fueling_form(query)
         elif path.startswith("/fuelings/") and path.endswith("/edit"):
             self.fueling_form(query, int(path.split("/")[2]))
+        elif path == "/vehicle-costs":
+            self.vehicle_costs_page(notice)
         elif path == "/import":
             self.import_page(notice)
         elif path == "/support":
@@ -1062,6 +1553,8 @@ class Handler(BaseHTTPRequestHandler):
             self.backup_json()
         elif path == "/export/fuelings.csv":
             self.export_fuelings()
+        elif path == "/export/energylab.xlsx":
+            self.export_xlsx()
         else:
             self.send_html(page("Nicht gefunden", '<div class="card empty">Diese Seite gibt es nicht.</div>'), 404)
 
@@ -1084,6 +1577,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.save_fueling(form)
             elif path.startswith("/fuelings/") and path.endswith("/delete"):
                 self.delete_fueling(int(path.split("/")[2]))
+            elif path == "/vehicle-costs/save":
+                self.save_vehicle_cost(form)
+            elif path.startswith("/vehicle-costs/") and path.endswith("/delete"):
+                self.delete_vehicle_cost(int(path.split("/")[2]))
             elif path == "/import/preview":
                 self.import_preview(form)
             elif path == "/import/commit":
@@ -1095,9 +1592,11 @@ class Handler(BaseHTTPRequestHandler):
                 imported, messages = backfill_home_assistant(str(form.get("start_date", "")))
                 notice = f"{imported} tägliche Historienwerte übernommen. " + "; ".join(messages)
                 self.redirect("/energy?notice=" + urllib.parse.quote(notice))
-            elif path == "/energy/water/save":
-                read_on, total = save_manual_water_reading(form.get("read_on"), form.get("total_value"))
-                notice = f"Wasserzählerstand {fmt_num(total)} m³ vom {read_on} wurde gespeichert."
+            elif path in ("/energy/readings/save", "/energy/water/save"):
+                metric = "water" if path == "/energy/water/save" else str(form.get("metric", ""))
+                read_on, total = save_manual_energy_reading(metric, form.get("read_on"), form.get("total_value"))
+                cfg = METRICS[metric]
+                notice = f"{cfg['label']}-Zählerstand {fmt_num(total)} {cfg['unit']} vom {read_on} wurde gespeichert."
                 self.redirect("/energy?notice=" + urllib.parse.quote(notice))
             elif path == "/energy/tariffs/save":
                 self.save_energy_tariff(form)
@@ -1112,47 +1611,225 @@ class Handler(BaseHTTPRequestHandler):
 
     def dashboard(self, period, notice):
         period = period if period in ("month", "year", "all") else "month"
-        start, _ = period_bounds(period)
-        where = "WHERE is_valid=1 AND read_on>=?" if start else "WHERE is_valid=1"
-        args = (start,) if start else ()
+        start, end = period_bounds(period)
+        period_clauses, args = ["is_valid=1"], []
+        if start:
+            period_clauses.append("read_on>=?")
+            args.append(start)
+        if end:
+            period_clauses.append("read_on<=?")
+            args.append(end)
+        where = "WHERE " + " AND ".join(period_clauses)
+        args = tuple(args)
         with connect() as db:
-            energy = {r["metric"]: r["value"] for r in db.execute(f"SELECT metric,SUM(delta_value) value FROM energy_readings {where} GROUP BY metric", args)}
-            costs = energy_costs(db, start)
-            pv_saved = pv_savings(db, start)
+            energy = {metric: allocated_usage(db, metric, start, end)[0] for metric in METRICS}
+            costs = energy_costs(db, start, end)
+            forecasts = {metric: settlement_forecast(db, metric) for metric in ("grid_import", "gas", "water")}
+            pv_saved = pv_savings(db, start, end)
             pv_saved_text = f"−{fmt_money(pv_saved)}" if pv_saved is not None else "–"
-            fwhere = "WHERE fueled_on>=?" if start else ""
-            fuel_args = (start,) if start else ()
+            fuel_clauses, fuel_args = [], []
+            if start:
+                fuel_clauses.append("fueled_on>=?")
+                fuel_args.append(start)
+            if end:
+                fuel_clauses.append("fueled_on<=?")
+                fuel_args.append(end)
+            fwhere = "WHERE " + " AND ".join(fuel_clauses) if fuel_clauses else ""
+            fuel_args = tuple(fuel_args)
             totals = db.execute(f"SELECT SUM(total_price) cost,SUM(liters) liters,MIN(odometer) minodo,MAX(odometer) maxodo FROM fuelings {fwhere}", fuel_args).fetchone()
             vehicles = db.execute("SELECT * FROM vehicles WHERE active=1 ORDER BY name").fetchall()
             diesel_avg = None
-            for vehicle in vehicles:
-                avg = consumption_summary(db, vehicle["id"])["average"]
-                if avg is not None:
-                    diesel_avg = avg
-                    break
+            total_cost_per_km = None
+            dashboard_vehicle_name = "Fahrzeug"
+            if vehicles:
+                dashboard_vehicle_name = vehicles[0]["name"]
+                diesel_avg = consumption_summary(db, vehicles[0]["id"])["average"]
+                total_cost_per_km = vehicle_cost_summary(db, vehicles[0]["id"])["cost_per_km"]
             distance = (totals["maxodo"] - totals["minodo"]) if totals["maxodo"] is not None and totals["minodo"] is not None else 0
             cards = "".join(
                 [
-                    self.metric_card("⚡", "Strombezug", energy.get("grid_import"), "kWh", f'<div class="muted">Kosten: {fmt_money(costs.get("grid_import"))}</div>' + sparkline(db, "grid_import")),
-                    self.metric_card("☀️", "PV-Eigenverbrauch", energy.get("pv_self"), "kWh", f'<div class="muted">Dadurch gespart: {pv_saved_text}</div>' + sparkline(db, "pv_self")),
-                    self.metric_card("🔥", "Gas", energy.get("gas"), "m³", f'<div class="muted">Kosten: {fmt_money(costs.get("gas"))}</div>' + sparkline(db, "gas")),
-                    self.metric_card("💧", "Wasser", energy.get("water"), "m³", f'<div class="muted">Kosten: {fmt_money(costs.get("water"))}</div>' + sparkline(db, "water")),
-                    self.metric_card("🚐", "T6.1 Ø-Verbrauch", diesel_avg, "l/100 km", ""),
+                    self.metric_card("⚡", "Strombezug", energy.get("grid_import"), "kWh", f'<div class="muted">Kosten: {fmt_money(costs.get("grid_import"))}</div>' + sparkline(db, "grid_import"), f"/energy/grid_import?period={period}"),
+                    self.metric_card("☀️", "PV-Eigenverbrauch", energy.get("pv_self"), "kWh", f'<div class="muted">Dadurch gespart: {pv_saved_text}</div>' + sparkline(db, "pv_self"), f"/energy/pv_self?period={period}"),
+                    self.metric_card("🔥", "Gas", energy.get("gas"), "m³", f'<div class="muted">Kosten: {fmt_money(costs.get("gas"))}</div>' + sparkline(db, "gas"), f"/energy/gas?period={period}"),
+                    self.metric_card("💧", "Wasser", energy.get("water"), "m³", f'<div class="muted">Kosten: {fmt_money(costs.get("water"))}</div>' + sparkline(db, "water"), f"/energy/water?period={period}"),
+                    self.metric_card("🚐", f"{dashboard_vehicle_name} Ø-Verbrauch", diesel_avg, "l/100 km", f'<div class="muted">Gesamtkosten: {fmt_num(total_cost_per_km,3)} €/km</div>', "/vehicle-costs"),
                 ]
             )
             vehicle_rows = ""
             for vehicle in vehicles:
                 summary = consumption_summary(db, vehicle["id"])
+                total_summary = vehicle_cost_summary(db, vehicle["id"])
                 adblue = adblue_summary(db, vehicle["id"])
-                vehicle_rows += f"<tr><td><strong>{esc(vehicle['name'])}</strong></td><td>{fmt_num(summary['average'])} l/100 km</td><td>{fmt_num(adblue['per_1000'])} l/1.000 km</td><td>{fmt_num(summary['distance'],0)} km</td></tr>"
+                vehicle_rows += f"<tr><td><strong>{esc(vehicle['name'])}</strong></td><td>{fmt_num(summary['average'])} l/100 km</td><td>{fmt_num(total_summary['cost_per_km'],3)} €/km</td><td>{fmt_num(adblue['per_1000'])} l/1.000 km</td><td>{fmt_num(total_summary['distance'],0)} km</td></tr>"
+        settlement_cards = ""
+        for metric in ("grid_import", "gas", "water"):
+            cfg = METRICS[metric]
+            forecast = forecasts.get(metric) or {"reason": "Keine Prognose verfügbar."}
+            if forecast.get("reason"):
+                settlement_cards += f"""<div class="card settlement-card"><h3>{cfg['icon']} {esc(cfg['label'])}</h3><div class="contract">Abrechnungsvorschau</div><div class="muted">{esc(forecast['reason'])}</div><div class="actions" style="margin-top:16px"><a href="/energy">Energiedaten ergänzen →</a></div></div>"""
+                continue
+            current = forecast["current"]
+            projected = forecast["projected"]
+            current_sign = "+" if current["balance"] >= 0 else "−"
+            projected_label = "voraussichtliche Erstattung" if projected["balance"] >= 0 else "voraussichtliche Nachzahlung"
+            projected_class = "ok" if projected["balance"] >= 0 else "warn"
+            settlement_cards += f"""<div class="card settlement-card"><h3>{cfg['icon']} {esc(cfg['label'])}</h3><div class="contract">{esc(forecast['provider'] or 'Tarif')} · {esc(forecast['contract_start'])} bis {esc(forecast['contract_end'])}</div><div class="settlement-block"><strong>Stand bis {esc(forecast['data_until'])}</strong><div class="row muted"><span>Kosten</span><span>{fmt_money(current['cost'])}</span></div><div class="row muted"><span>anteilige Abschläge</span><span>{fmt_money(current['advance'])}</span></div><div class="row"><span>Zwischenstand</span><strong>{current_sign}{fmt_money(abs(current['balance']))}</strong></div></div><div class="settlement-block"><strong>Hochrechnung bis {esc(forecast['contract_end'])}</strong><div class="row muted"><span>Kosten</span><span>{fmt_money(projected['cost'])}</span></div><div class="row muted"><span>Abschläge</span><span>{fmt_money(projected['advance'])}</span></div><div class="row"><span>{projected_label}</span><strong class="amount {projected_class}">{fmt_money(abs(projected['balance']))}</strong></div></div></div>"""
         labels = {"month": "Monat", "year": "Jahr", "all": "Gesamt"}
         tabs = "".join(f'<a class="{"active" if period==key else ""}" href="/?period={key}">{label}</a>' for key, label in labels.items())
-        body = f"""<div class="topbar"><div><h1>Energie & Verbrauch</h1><div class="subtitle">Deine lokalen Verbrauchsdaten auf einen Blick</div></div><div class="tabs">{tabs}</div></div><div class="grid">{cards}</div><section class="section two"><div class="card"><div class="section-head"><h2>Fahrzeuge</h2><a href="/fuelings/new">Tankung erfassen →</a></div><div class="table-wrap"><table><thead><tr><th>Fahrzeug</th><th>Diesel</th><th>AdBlue</th><th>ausgewertet</th></tr></thead><tbody>{vehicle_rows or '<tr><td colspan="4" class="empty">Noch keine Fahrzeugdaten</td></tr>'}</tbody></table></div></div><div class="card metric"><div class="icon">€</div><div class="label">Tankkosten {labels[period]}</div><div class="value">{fmt_money(totals['cost'])}</div><div class="muted">{fmt_num(totals['liters'])} Liter · ca. {fmt_num(distance,0)} km</div><div class="actions" style="margin-top:20px"><a class="btn" href="/fuelings/new">+ Tankung</a><a class="btn secondary" href="/import">CSV importieren</a></div></div></section>"""
+        body = f"""<div class="topbar"><div><h1>Energie & Verbrauch</h1><div class="subtitle">Deine lokalen Verbrauchsdaten auf einen Blick</div></div><div class="tabs">{tabs}</div></div><div class="grid">{cards}</div><section class="section"><div class="section-head"><div><h2>Voraussichtliche Abrechnung</h2><div class="muted">Hochrechnung aus dem bisherigen Tagesverbrauch bis zum Ende des jeweils aktuellen Tarifzeitraums</div></div><a href="/energy">Tarife und Abschläge bearbeiten →</a></div><div class="settlement-grid">{settlement_cards}</div><p class="muted">Berechnung: Abschläge − (Verbrauchskosten + Grundpreis). Ein positiver Saldo ergibt eine Erstattung, ein negativer eine Nachzahlung. Die PV-Ersparnis bleibt separat und reduziert die tatsächlichen Stromkosten nicht.</p></section><section class="section two"><div class="card"><div class="section-head"><h2>Fahrzeuge</h2><a href="/vehicle-costs">Fahrzeugkosten verwalten →</a></div><div class="table-wrap"><table><thead><tr><th>Fahrzeug</th><th>Diesel</th><th>Gesamtkosten/km</th><th>AdBlue</th><th>gefahren</th></tr></thead><tbody>{vehicle_rows or '<tr><td colspan="5" class="empty">Noch keine Fahrzeugdaten</td></tr>'}</tbody></table></div></div><div class="card metric"><div class="icon">€</div><div class="label">Tankkosten {labels[period]}</div><div class="value">{fmt_money(totals['cost'])}</div><div class="muted">{fmt_num(totals['liters'])} Liter · ca. {fmt_num(distance,0)} km</div><div class="actions" style="margin-top:20px"><a class="btn" href="/fuelings/new">+ Tankung</a><a class="btn secondary" href="/vehicle-costs">+ weitere Kosten</a></div></div></section>"""
         self.send_html(page("Dashboard", body, "/", notice))
 
     @staticmethod
-    def metric_card(icon, label, value, unit, extra):
-        return f'<div class="card metric"><div class="icon">{icon}</div><div class="value">{fmt_num(value)} <small style="font-size:14px">{esc(unit)}</small></div><div class="label">{esc(label)}</div>{extra}</div>'
+    def metric_card(icon, label, value, unit, extra, href=None):
+        tag, end_tag = (f'<a class="card metric metric-link" href="{esc(href)}">', "</a>") if href else ('<div class="card metric">', "</div>")
+        return f'{tag}<div class="icon">{icon}</div><div class="value">{fmt_num(value)} <small style="font-size:14px">{esc(unit)}</small></div><div class="label">{esc(label)}</div>{extra}{end_tag}'
+
+    def energy_detail_page(self, metric, period, requested_month=""):
+        cfg = METRICS[metric]
+        period = period if period in ("month", "year", "all") else "year"
+        current_month = date.today().replace(day=1)
+        selected_month = month_start_from_query(requested_month) if period == "month" else None
+        if selected_month:
+            start_on, end_on = selected_month_bounds(selected_month)
+        else:
+            start_on, end_on = period_bounds(period)
+        clauses = ["metric=?"]
+        args = [metric]
+        if start_on:
+            clauses.append("read_on>=?")
+            args.append(start_on)
+        if end_on:
+            clauses.append("read_on<=?")
+            args.append(end_on)
+        with connect() as db:
+            readings = db.execute(
+                f"SELECT * FROM energy_readings WHERE {' AND '.join(clauses)} ORDER BY read_on,id",
+                args,
+            ).fetchall()
+            tariff_metric = "grid_import" if metric == "pv_self" else metric
+            tariffs = db.execute(
+                "SELECT * FROM energy_tariffs WHERE metric=? ORDER BY valid_from DESC,id DESC",
+                (tariff_metric,),
+            ).fetchall()
+            earliest = db.execute(
+                "SELECT MIN(read_on) AS first_on FROM energy_readings WHERE metric=?",
+                (metric,),
+            ).fetchone()["first_on"]
+            finances = energy_finances(db, start_on, end_on)
+            pv_saved = pv_savings(db, start_on, end_on) if metric == "pv_self" else None
+            historical_month = bool(selected_month and selected_month < current_month)
+            forecast = settlement_forecast(db, metric) if metric in ("grid_import", "gas", "water") and not historical_month else None
+            total_consumption = allocated_usage(db, metric, start_on, end_on)[0]
+            reading_costs = {}
+            previous_valid_day = None
+            for item in db.execute("SELECT read_on,delta_value FROM energy_readings WHERE metric=? AND is_valid=1 ORDER BY read_on,id", (metric,)):
+                current_valid_day = date.fromisoformat(item["read_on"])
+                if item["delta_value"] is not None:
+                    interval_start = (previous_valid_day + timedelta(days=1)) if previous_valid_day else current_valid_day
+                    reading_costs[item["read_on"]] = allocated_usage(db, metric, interval_start.isoformat(), item["read_on"], tariff_metric)[1]
+                previous_valid_day = current_valid_day
+
+        labels = {"month": "Monat", "year": "Jahr", "all": "Gesamt"}
+        month_href = f"/energy/{metric}?period=month"
+        if selected_month:
+            month_href += f"&month={selected_month:%Y-%m}"
+        tabs = "".join(
+            f'<a class="{"active" if period == key else ""}" href="{month_href if key == "month" else f"/energy/{metric}?period={key}"}">{label}</a>'
+            for key, label in labels.items()
+        )
+        month_navigation = ""
+        if selected_month:
+            earliest_month = date.fromisoformat(earliest).replace(day=1) if earliest else current_month
+            previous_month = shift_month(selected_month, -1) if selected_month > earliest_month else None
+            next_month = shift_month(selected_month, 1) if selected_month < current_month else None
+            previous_control = (
+                f'<a class="month-arrow" href="/energy/{metric}?period=month&month={previous_month:%Y-%m}" aria-label="Vorheriger Monat">‹</a>'
+                if previous_month
+                else '<span class="month-arrow disabled" aria-disabled="true" title="Erster Monat mit Quelldaten">‹</span>'
+            )
+            next_control = (
+                f'<a class="month-arrow" href="/energy/{metric}?period=month&month={next_month:%Y-%m}" aria-label="Nächster Monat">›</a>'
+                if next_month
+                else '<span class="month-arrow disabled" aria-disabled="true" title="Aktueller Monat">›</span>'
+            )
+            month_navigation = f'<div class="month-nav">{previous_control}<div class="month-title"><span class="muted">Monatsübersicht</span><strong>{month_label(selected_month)}</strong></div>{next_control}</div>'
+        invalid_count = sum(1 for row in readings if not row["is_valid"])
+        values = finances.get(metric)
+
+        def applicable_tariff(read_on):
+            return next(
+                (
+                    tariff
+                    for tariff in tariffs
+                    if tariff["valid_from"] <= read_on
+                    and (not tariff["valid_to"] or read_on <= tariff["valid_to"])
+                ),
+                None,
+            )
+
+        reading_rows = ""
+        converted_total = 0.0
+        for row in reversed(readings):
+            tariff = applicable_tariff(row["read_on"])
+            delta = float(row["delta_value"]) if row["delta_value"] is not None and row["is_valid"] else None
+            factor = float(tariff["kwh_per_unit"]) if tariff and metric == "gas" else 1.0
+            converted = delta * factor if delta is not None and metric == "gas" else None
+            if converted is not None:
+                converted_total += converted
+            amount = None
+            if delta is not None:
+                amount = reading_costs.get(row["read_on"])
+            if tariff:
+                if tariff_metric in ("grid_import", "gas"):
+                    price_text = f"{fmt_num(float(tariff['price_per_kwh']) * 100, 2)} Cent/kWh"
+                else:
+                    price_text = f"{fmt_num(tariff['price_per_kwh'], 4)} €/m³"
+                tariff_text = tariff["provider"] or "Tarif ohne Anbieter"
+                if metric == "gas":
+                    tariff_text += f" · {fmt_num(factor, 4)} kWh/m³"
+            else:
+                price_text = "–"
+                tariff_text = "kein Tarif für dieses Datum"
+            if not row["is_valid"]:
+                status = f'<span class="badge warn">ausgeschlossen</span><br><span>{esc(row["invalid_reason"] or "unplausibler Wert")}</span>'
+                row_class = ' class="reading-invalid"'
+            elif row["delta_value"] is None:
+                status = '<span class="badge">Ausgangsstand</span>'
+                row_class = ""
+            else:
+                status = '<span class="badge ok">gültig</span>'
+                row_class = ""
+            source = "manuell" if row["source"] == "manual" else (row["source"] or "Home Assistant")
+            reading_rows += f"""<tr{row_class}><td>{date.fromisoformat(row['read_on']).strftime('%d.%m.%Y')}</td><td><strong>{fmt_num(row['total_value'])} {esc(row['unit'])}</strong></td><td>{fmt_num(delta) + ' ' + esc(cfg['unit']) if delta is not None else '–'}</td>{f'<td>{fmt_num(converted)} kWh</td>' if metric == 'gas' else ''}<td>{esc(tariff_text)}</td><td>{price_text}</td><td>{fmt_money(amount)}</td><td>{esc(source)}<br><span class="muted">{esc(row['entity_id'])}</span></td><td>{status}</td></tr>"""
+
+        period_caption = month_label(selected_month) if selected_month else labels[period]
+        summary_boxes = [
+            f'<div class="summary-box"><div class="muted">Verbrauch {period_caption}</div><div class="value">{fmt_num(total_consumption)} {esc(cfg["unit"])}</div></div>'
+        ]
+        if metric == "gas":
+            summary_boxes.append(f'<div class="summary-box"><div class="muted">umgerechnet</div><div class="value">{fmt_num(converted_total)} kWh</div></div>')
+        if metric == "pv_self":
+            summary_boxes.append(f'<div class="summary-box"><div class="muted">Dadurch gespart</div><div class="value">−{fmt_money(pv_saved)}</div></div>')
+        elif values:
+            summary_boxes.extend(
+                [
+                    f'<div class="summary-box"><div class="muted">Verbrauchskosten</div><div class="value">{fmt_money(values["variable"])}</div></div>',
+                    f'<div class="summary-box"><div class="muted">Grundpreis</div><div class="value">{fmt_money(values["base_fee"])}</div></div>',
+                    f'<div class="summary-box"><div class="muted">Gesamtkosten</div><div class="value">{fmt_money(values["cost"])}</div></div>',
+                    f'<div class="summary-box"><div class="muted">Abschläge</div><div class="value">{fmt_money(values["advance"])}</div></div>',
+                ]
+            )
+        if forecast and forecast.get("projected"):
+            projected_balance = forecast["projected"]["balance"]
+            projected_label = "Voraussichtliche Erstattung" if projected_balance >= 0 else "Voraussichtliche Nachzahlung"
+            projected_class = "ok" if projected_balance >= 0 else "warn"
+            summary_boxes.append(f'<div class="summary-box"><div class="muted">{projected_label} bis {esc(forecast["contract_end"])}</div><div class="value {projected_class}">{fmt_money(abs(projected_balance))}</div></div>')
+
+        anomaly_html = f'<div class="notice warn">{invalid_count} unplausible oder während eines Ausfalls erfasste Werte sind rot markiert und werden in Verbrauch und Kosten nicht berücksichtigt.</div>' if invalid_count else ""
+        gas_help = '<p class="muted">Beim Gas werden für jeden Tag der Zählerverbrauch in m³, der gültige Umrechnungsfaktor in kWh/m³ und die daraus berechneten kWh getrennt angezeigt.</p>' if metric == "gas" else ""
+        conversion_header = "<th>Umgerechnet</th>" if metric == "gas" else ""
+        body = f"""<div class="topbar"><div><a href="/">← Dashboard</a><h1 style="margin-top:8px">{cfg['icon']} {esc(cfg['label'])}</h1><div class="subtitle">Detaillierte Messwerte, Kosten und Plausibilitätsprüfung</div></div><div class="tabs">{tabs}</div></div>{month_navigation}{anomaly_html}<div class="card"><div class="summary-grid">{"".join(summary_boxes)}</div></div><section class="section card"><div class="section-head"><h2>Tagesverbrauch</h2><div class="chart-legend"><span class="legend-line">gültige Werte</span></div></div><div class="table-wrap">{detail_chart(readings, 'delta_value', cfg['unit'])}</div></section><section class="section card"><div class="section-head"><h2>Zählerstand und Ausfälle</h2><div class="chart-legend"><span class="legend-line">gültiger Verlauf</span><span class="legend-invalid">ausgeschlossen</span></div></div><div class="table-wrap">{detail_chart(readings, 'total_value', cfg['unit'], True)}</div></section><section class="section card"><div class="section-head"><div><h2>Alle Messwerte</h2>{gas_help}</div><span class="badge">{len(readings)} Einträge</span></div><div class="table-wrap"><table><thead><tr><th>Datum</th><th>Zählerstand</th><th>Verbrauch</th>{conversion_header}<th>Tarif / Faktor</th><th>Arbeitspreis</th><th>{'Ersparnis' if metric == 'pv_self' else 'Kosten'}</th><th>Quelle</th><th>Prüfung</th></tr></thead><tbody>{reading_rows or '<tr><td colspan="9" class="empty">In diesem Zeitraum sind noch keine Werte vorhanden.</td></tr>'}</tbody></table></div></section>"""
+        self.send_html(page(f"{cfg['label']} Details", body, "/energy"))
 
     def energy_page(self, notice):
         token = self.cookie_token()
@@ -1161,6 +1838,7 @@ class Handler(BaseHTTPRequestHandler):
             logs = db.execute("SELECT * FROM sync_log ORDER BY id DESC LIMIT 12").fetchall()
             tariffs = db.execute("SELECT * FROM energy_tariffs ORDER BY valid_from DESC,id DESC").fetchall()
             finances = energy_finances(db)
+            forecasts = {metric: settlement_forecast(db, metric) for metric in ("grid_import", "gas", "water")}
             pv_saved = pv_savings(db)
             water_readings = db.execute(
                 "SELECT * FROM energy_readings WHERE metric='water' AND is_valid=1 ORDER BY read_on DESC,id DESC LIMIT 12"
@@ -1177,7 +1855,8 @@ class Handler(BaseHTTPRequestHandler):
         rows = ""
         for key, cfg in METRICS.items():
             value = latest.get(key)
-            values = finances.get(key)
+            forecast = forecasts.get(key)
+            values = forecast["current"] if forecast and forecast.get("current") else finances.get(key)
             variable = fmt_money(values["variable"]) if values else "–"
             base_fee = fmt_money(values["base_fee"]) if values else "–"
             cost = fmt_money(values["cost"]) if values else "–"
@@ -1189,9 +1868,18 @@ class Handler(BaseHTTPRequestHandler):
                 balance_html = f'<span class="badge {balance_class}">{fmt_money(abs(balance))} {balance_label}</span>'
             else:
                 balance_html = "–"
+            if forecast and forecast.get("projected"):
+                projected_balance = forecast["projected"]["balance"]
+                projected_label = "Erstattung" if projected_balance >= 0 else "Nachzahlung"
+                projected_class = "ok" if projected_balance >= 0 else "warn"
+                projected_html = f'<span class="badge {projected_class}">{fmt_money(abs(projected_balance))} {projected_label}</span><br><span class="muted">bis {esc(forecast["contract_end"])}</span>'
+            elif key in ("grid_import", "gas", "water"):
+                projected_html = f'<span class="muted">{esc((forecast or {}).get("reason", "Keine Hochrechnung verfügbar."))}</span>'
+            else:
+                projected_html = "–"
             entity_label = "manuelle Eingabe" if key == "water" else (cfg["entity"] or "nicht eingerichtet")
             saving_html = f'<strong>−{fmt_money(pv_saved)}</strong><br><span class="badge ok">dadurch gespart</span>' if key == "pv_self" and pv_saved is not None else "–"
-            rows += f"<tr><td>{cfg['icon']} <strong>{esc(cfg['label'])}</strong></td><td>{esc(entity_label)}</td><td>{fmt_num(value['total_value'])+' '+esc(value['unit']) if value else '–'}</td><td>{esc(value['read_on']) if value else '–'}</td><td>{variable}</td><td>{base_fee}</td><td><strong>{cost}</strong></td><td>{advance}</td><td>{balance_html if key in ('grid_import', 'gas', 'water') else '–'}</td><td>{saving_html}</td></tr>"
+            rows += f"<tr><td>{cfg['icon']} <strong>{esc(cfg['label'])}</strong></td><td>{esc(entity_label)}</td><td>{fmt_num(value['total_value'])+' '+esc(value['unit']) if value else '–'}</td><td>{esc(value['read_on']) if value else '–'}</td><td>{variable}</td><td>{base_fee}</td><td><strong>{cost}</strong></td><td>{advance}</td><td>{balance_html if key in ('grid_import', 'gas', 'water') else '–'}</td><td>{projected_html}</td><td>{saving_html}</td></tr>"
         logrows = "".join(f"<tr><td>{esc(r['synced_at'])}</td><td><span class=\"badge {'ok' if r['status']=='ok' else 'warn'}\">{esc(r['status'])}</span></td><td>{esc(r['message'])}</td></tr>" for r in logs)
         waterrows = "".join(
             f"<tr><td>{esc(r['read_on'])}</td><td>{fmt_num(r['total_value'])} m³</td><td>{fmt_num(r['delta_value']) + ' m³' if r['delta_value'] is not None else 'Erster Stand'}</td></tr>"
@@ -1214,9 +1902,15 @@ class Handler(BaseHTTPRequestHandler):
         readiness = '<span class="good-dot"></span> eingerichtet' if ha_ready() else '<span class="warning-dot"></span> Token/URL noch eintragen'
         default_start = date(date.today().year, 1, 1).isoformat()
         csrf = csrf_for(token)
-        body = f"""<div class="topbar"><div><h1>Energie</h1><div class="subtitle">Tägliche Zählerstände aus Home Assistant · {readiness}</div></div><form method="post" action="/energy/sync"><input type="hidden" name="csrf" value="{csrf}"><button class="btn">Jetzt synchronisieren</button></form></div>{anomaly_html}
-        <div class="card"><div class="table-wrap"><table><thead><tr><th>Messgröße</th><th>Datenquelle</th><th>Letzter Stand</th><th>Datum</th><th>Verbrauchskosten</th><th>Grundpreis</th><th>Gesamtkosten</th><th>Abschläge</th><th>Prognose</th><th>PV-Ersparnis</th></tr></thead><tbody>{rows}</tbody></table></div><p class="muted" style="padding:0 28px 22px">Verbrauchskosten + Grundpreis = Gesamtkosten. Die PV-Ersparnis wird separat mit dem gültigen Strom-Arbeitspreis berechnet und reduziert diese Kosten nicht.</p></div>
-        <section class="section card"><div class="section-head"><h2>Wasserzähler manuell erfassen</h2><span class="badge">nur manuell</span></div><div class="two"><form method="post" action="/energy/water/save"><input type="hidden" name="csrf" value="{csrf}"><div class="form-grid"><div class="field"><label>Ablesedatum</label><input type="date" name="read_on" value="{date.today().isoformat()}" max="{date.today().isoformat()}" required></div><div class="field"><label>Zählerstand in m³</label><input inputmode="decimal" name="total_value" placeholder="z. B. 123,456" required></div></div><p class="muted">Eine erneute Eingabe für dasselbe Datum korrigiert den vorhandenen Stand. Die Verbräuche zwischen allen Ablesungen werden danach neu berechnet.</p><button class="btn" style="margin-top:8px">Wasserstand speichern</button></form><div class="table-wrap"><table><thead><tr><th>Datum</th><th>Zählerstand</th><th>Verbrauch seit davor</th></tr></thead><tbody>{waterrows or '<tr><td colspan="3" class="empty">Noch keine Wasserstände erfasst</td></tr>'}</tbody></table></div></div></section>
+        manual_forms = ""
+        for metric in ("grid_import", "gas", "water"):
+            cfg = METRICS[metric]
+            example = "12.345,67" if metric == "grid_import" else "1.234,567"
+            manual_forms += f"""<form class="card" method="post" action="/energy/readings/save"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="metric" value="{metric}"><div class="section-head"><h2>{cfg['icon']} {esc(cfg['label'])}</h2><span class="badge">manuell</span></div><div class="field"><label>Ablesedatum</label><input type="date" name="read_on" value="{date.today().isoformat()}" max="{date.today().isoformat()}" required></div><div class="field" style="margin-top:12px"><label>Zählerstand in {esc(cfg['unit'])}</label><input inputmode="decimal" name="total_value" placeholder="z. B. {example}" required></div><button class="btn" style="margin-top:16px">Zählerstand speichern</button></form>"""
+        body = f"""<div class="topbar"><div><h1>Energie</h1><div class="subtitle">Tägliche Zählerstände aus Home Assistant · automatisch um {SYNC_HOUR:02d}:{SYNC_MINUTE:02d} Uhr · {readiness}</div></div><form method="post" action="/energy/sync"><input type="hidden" name="csrf" value="{csrf}"><button class="btn">Jetzt synchronisieren</button></form></div>{anomaly_html}
+        <div class="card"><div class="table-wrap"><table><thead><tr><th>Messgröße</th><th>Datenquelle</th><th>Letzter Stand</th><th>Datum</th><th>Verbrauchskosten</th><th>Grundpreis</th><th>Gesamtkosten</th><th>Abschläge</th><th>Zwischenstand</th><th>Hochrechnung</th><th>PV-Ersparnis</th></tr></thead><tbody>{rows}</tbody></table></div><p class="muted" style="padding:0 28px 22px">Verbrauchskosten + Grundpreis = Gesamtkosten. Die Hochrechnung verwendet den bisherigen durchschnittlichen Tagesverbrauch bis zum Tarifende. Die PV-Ersparnis wird separat mit dem gültigen Strom-Arbeitspreis berechnet und reduziert diese Kosten nicht.</p></div>
+        <section class="section"><div class="section-head"><div><h2>Zählerstände manuell erfassen</h2><div class="muted">Auch rückwirkend möglich. Der Stand muss chronologisch zwischen dem vorherigen und dem nachfolgenden Zählerstand liegen.</div></div></div><div class="grid">{manual_forms}</div><p class="muted">Eine Eingabe für ein bereits vorhandenes Datum korrigiert diesen Wert. Danach werden Verbrauch, historische Tarifkosten und Salden automatisch neu berechnet.</p></section>
+        <section class="section card"><div class="section-head"><h2>Letzte manuelle Wasserstände</h2></div><div class="table-wrap"><table><thead><tr><th>Datum</th><th>Zählerstand</th><th>Verbrauch seit davor</th></tr></thead><tbody>{waterrows or '<tr><td colspan="3" class="empty">Noch keine Wasserstände erfasst</td></tr>'}</tbody></table></div></section>
         <section class="section two"><div class="card"><div class="section-head"><h2>Historie einmalig importieren</h2></div><p class="muted">Übernimmt vorhandene tägliche Langzeitstatistiken aus Home Assistant. Ein erneuter Lauf aktualisiert dieselben Tage und erzeugt keine Duplikate.</p><form method="post" action="/energy/backfill"><input type="hidden" name="csrf" value="{csrf}"><div class="field"><label>Historie ab</label><input type="date" name="start_date" value="{default_start}" max="{date.today().isoformat()}" required></div><button class="btn" style="margin-top:18px">Historie importieren</button></form></div>
         <div class="card"><div class="section-head"><h2>Stromtarif hinzufügen</h2><span class="badge">{tariff_counts['grid_import']} von {TARIFF_LIMIT}</span></div><form method="post" action="/energy/tariffs/save"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="metric" value="grid_import"><div class="form-grid"><div class="field full"><label>Anbieter</label><input name="provider" maxlength="100" placeholder="z. B. Stadtwerke Musterstadt" required></div><div class="field"><label>Gültig von</label><input type="date" name="valid_from" required></div><div class="field"><label>Gültig bis</label><input type="date" name="valid_to"></div><div class="field"><label>Strompreis in Cent/kWh</label><input inputmode="decimal" name="price_per_kwh" placeholder="z. B. 32,90" required></div><div class="field"><label>Grundpreis in €/Monat</label><input inputmode="decimal" name="base_fee_monthly" placeholder="z. B. 12,50" required></div><div class="field full"><label>Abschlag in €/Monat</label><input inputmode="decimal" name="advance_monthly" placeholder="z. B. 95,00" required></div></div><button class="btn" style="margin-top:18px" {'disabled' if tariff_counts['grid_import'] >= TARIFF_LIMIT else ''}>Stromtarif speichern</button>{'<p class="muted">Das Limit von fünf Stromtarifen ist erreicht. Lösche bei Bedarf einen alten Zeitraum.</p>' if tariff_counts['grid_import'] >= TARIFF_LIMIT else ''}</form></div></section>
         <section class="section card"><div class="section-head"><h2>Gastarif hinzufügen</h2><span class="badge">{tariff_counts['gas']} von {TARIFF_LIMIT}</span></div><form method="post" action="/energy/tariffs/save"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="metric" value="gas"><div class="form-grid"><div class="field full"><label>Anbieter</label><input name="provider" maxlength="100" placeholder="z. B. Stadtwerke Musterstadt" required></div><div class="field"><label>Gültig von</label><input type="date" name="valid_from" required></div><div class="field"><label>Gültig bis</label><input type="date" name="valid_to"></div><div class="field"><label>Gaspreis in Cent/kWh</label><input inputmode="decimal" name="price_per_kwh" placeholder="z. B. 10,90" required></div><div class="field"><label>Umrechnung kWh pro m³</label><input inputmode="decimal" name="kwh_per_unit" placeholder="laut Gasabrechnung, z. B. 10,42" required></div><div class="field"><label>Grundpreis in €/Monat</label><input inputmode="decimal" name="base_fee_monthly" placeholder="z. B. 14,00" required></div><div class="field"><label>Abschlag in €/Monat</label><input inputmode="decimal" name="advance_monthly" placeholder="z. B. 120,00" required></div></div><p class="muted">Der Gaszähler liefert m³. Den periodenbezogenen Umrechnungsfaktor findest du auf der Gasabrechnung.</p><button class="btn" style="margin-top:8px" {'disabled' if tariff_counts['gas'] >= TARIFF_LIMIT else ''}>Gastarif speichern</button>{'<p class="muted">Das Limit von fünf Gastarifen ist erreicht. Lösche bei Bedarf einen alten Zeitraum.</p>' if tariff_counts['gas'] >= TARIFF_LIMIT else ''}</form></section>
@@ -1354,13 +2048,17 @@ class Handler(BaseHTTPRequestHandler):
         with connect() as db:
             rows = db.execute("SELECT f.*,v.name vehicle_name FROM fuelings f JOIN vehicles v ON v.id=f.vehicle_id ORDER BY fueled_on DESC,odometer DESC,id DESC").fetchall()
             values = {}
+            costs = {}
             for vehicle_id in {r["vehicle_id"] for r in rows}:
-                values.update(consumption_summary(db, vehicle_id)["rows"])
+                summary = consumption_summary(db, vehicle_id)
+                values.update(summary["rows"])
+                costs.update(summary["row_costs"])
         table = ""
         for row in rows:
             consumption = f"{fmt_num(values[row['id']])} l/100 km" if row["id"] in values else "–"
-            table += f"""<tr><td>{esc(datetime.strptime(row['fueled_on'],'%Y-%m-%d').strftime('%d.%m.%Y'))}</td><td><strong>{esc(row['vehicle_name'])}</strong><br><span class="badge">{esc(row['fluid'])}</span></td><td>{fmt_num(row['odometer'],0)} km</td><td>{fmt_num(row['liters'])} l</td><td>{fmt_num(row['unit_price'],3)} €/l</td><td>{fmt_money(row['total_price'])}</td><td>{esc(FILL_TYPES[row['fill_type']])}</td><td>{consumption}</td><td><div class="actions"><a href="/fuelings/{row['id']}/edit">Bearbeiten</a><form method="post" action="/fuelings/{row['id']}/delete" onsubmit="return confirm('Tankung wirklich löschen?')"><input type="hidden" name="csrf" value="{csrf_for(token)}"><button style="border:0;background:none;color:#ff8e98;cursor:pointer">Löschen</button></form></div></td></tr>"""
-        body = f"""<div class="topbar"><div><h1>Tankungen</h1><div class="subtitle">Voll- und Teiltankungen mit automatischer Verbrauchsberechnung</div></div><a class="btn" href="/fuelings/new">+ Tankung erfassen</a></div><div class="card table-wrap"><table><thead><tr><th>Datum</th><th>Fahrzeug</th><th>Km-Stand</th><th>Menge</th><th>Preis</th><th>Gesamt</th><th>Art</th><th>Verbrauch</th><th></th></tr></thead><tbody>{table or '<tr><td colspan="9" class="empty">Noch keine Tankungen. Importiere deine Spritmonitor-CSV.</td></tr>'}</tbody></table></div>"""
+            cost_per_km = f"{fmt_num(costs[row['id']],3)} €/km" if row["id"] in costs else "–"
+            table += f"""<tr><td>{esc(datetime.strptime(row['fueled_on'],'%Y-%m-%d').strftime('%d.%m.%Y'))}</td><td><strong>{esc(row['vehicle_name'])}</strong><br><span class="badge">{esc(row['fluid'])}</span></td><td>{fmt_num(row['odometer'],0)} km</td><td>{fmt_num(row['liters'])} l</td><td>{fmt_num(row['unit_price'],3)} €/l</td><td>{fmt_money(row['total_price'])}</td><td>{esc(FILL_TYPES[row['fill_type']])}</td><td>{consumption}</td><td>{cost_per_km}</td><td><div class="actions"><a href="/fuelings/{row['id']}/edit">Bearbeiten</a><form method="post" action="/fuelings/{row['id']}/delete" onsubmit="return confirm('Tankung wirklich löschen?')"><input type="hidden" name="csrf" value="{csrf_for(token)}"><button style="border:0;background:none;color:#ff8e98;cursor:pointer">Löschen</button></form></div></td></tr>"""
+        body = f"""<div class="topbar"><div><h1>Tankungen</h1><div class="subtitle">Voll- und Teiltankungen mit automatischer Verbrauchs- und Kostenberechnung</div></div><a class="btn" href="/fuelings/new">+ Tankung erfassen</a></div><div class="card table-wrap"><table><thead><tr><th>Datum</th><th>Fahrzeug</th><th>Km-Stand</th><th>Menge</th><th>Preis</th><th>Gesamt</th><th>Art</th><th>Verbrauch</th><th>Tankkosten/km</th><th></th></tr></thead><tbody>{table or '<tr><td colspan="10" class="empty">Noch keine Tankungen. Importiere deine Spritmonitor-CSV.</td></tr>'}</tbody></table></div>"""
         self.send_html(page("Tankungen", body, "/fuelings", notice))
 
     def fueling_form(self, query, fueling_id=None):
@@ -1405,6 +2103,57 @@ class Handler(BaseHTTPRequestHandler):
         with connect() as db:
             db.execute("DELETE FROM fuelings WHERE id=?", (fueling_id,))
         self.redirect("/fuelings?notice=" + urllib.parse.quote("Tankung wurde gelöscht."))
+
+    def vehicle_costs_page(self, notice):
+        token = self.cookie_token()
+        with connect() as db:
+            vehicles = db.execute("SELECT * FROM vehicles WHERE active=1 ORDER BY name").fetchall()
+            expenses = db.execute(
+                """SELECT e.*,v.name vehicle_name FROM vehicle_expenses e
+                   JOIN vehicles v ON v.id=e.vehicle_id
+                   ORDER BY e.incurred_on DESC,e.id DESC"""
+            ).fetchall()
+            summary_cards = ""
+            for vehicle in vehicles:
+                summary = vehicle_cost_summary(db, vehicle["id"])
+                range_text = "Noch keine Fahrstrecke"
+                if summary["distance"] > 0:
+                    range_text = f"{fmt_num(summary['first_odometer'],0)} bis {fmt_num(summary['last_odometer'],0)} km"
+                summary_cards += f"""<div class="card"><div class="section-head"><h2>{esc(vehicle['name'])}</h2><span class="badge">{fmt_num(summary['distance'],0)} km</span></div><div class="summary-grid"><div class="summary-box"><div class="muted">Tankkosten</div><div class="value">{fmt_money(summary['fuel_cost'])}</div></div><div class="summary-box"><div class="muted">Weitere Kosten</div><div class="value">{fmt_money(summary['extra_cost'])}</div></div><div class="summary-box"><div class="muted">Gesamtkosten</div><div class="value">{fmt_money(summary['total_cost'])}</div></div><div class="summary-box"><div class="muted">Gesamtkosten/km</div><div class="value">{fmt_num(summary['cost_per_km'],3)} €/km</div></div></div><p class="muted" style="margin-bottom:0">Berechnete Fahrstrecke: {range_text}</p></div>"""
+        vehicle_options = "".join(f'<option value="{v["id"]}">{esc(v["name"])}</option>' for v in vehicles)
+        category_options = "".join(f'<option value="{esc(category)}">{esc(category)}</option>' for category in VEHICLE_COST_CATEGORIES)
+        rows = ""
+        for expense in expenses:
+            description = esc(expense["description"]) or '<span class="muted">–</span>'
+            note = f'<br><span class="muted">{esc(expense["note"])}</span>' if expense["note"] else ""
+            rows += f"""<tr><td>{esc(datetime.strptime(expense['incurred_on'],'%Y-%m-%d').strftime('%d.%m.%Y'))}</td><td><strong>{esc(expense['vehicle_name'])}</strong></td><td>{esc(expense['category'])}</td><td>{description}{note}</td><td>{fmt_money(expense['amount'])}</td><td><form method="post" action="/vehicle-costs/{expense['id']}/delete" onsubmit="return confirm('Kosten wirklich löschen?')"><input type="hidden" name="csrf" value="{csrf_for(token)}"><button style="border:0;background:none;color:#ff8e98;cursor:pointer">Löschen</button></form></td></tr>"""
+        body = f"""<div class="topbar"><div><h1>Fahrzeugkosten</h1><div class="subtitle">Tankkosten und weitere Fahrzeugkosten gemeinsam pro Kilometer auswerten</div></div></div><div class="grid">{summary_cards or '<div class="card empty">Bitte zuerst ein Fahrzeug anlegen.</div>'}</div><section class="section card"><div class="section-head"><div><h2>Weitere Kosten erfassen</h2><div class="muted">Zum Beispiel Versicherung, Kfz-Steuer, Reparatur, Wartung oder Reifen</div></div></div><form method="post" action="/vehicle-costs/save"><input type="hidden" name="csrf" value="{csrf_for(token)}"><div class="form-grid"><div class="field"><label>Fahrzeug</label><select name="vehicle_id" required>{vehicle_options}</select></div><div class="field"><label>Datum</label><input type="date" name="incurred_on" value="{date.today().isoformat()}" required></div><div class="field"><label>Kategorie</label><select name="category" required>{category_options}</select></div><div class="field"><label>Betrag in €</label><input inputmode="decimal" name="amount" placeholder="z. B. 749,00" required></div><div class="field full"><label>Beschreibung</label><input name="description" maxlength="160" placeholder="z. B. Jahresbeitrag 2026 oder Inspektion"></div><div class="field full"><label>Bemerkung</label><textarea name="note" maxlength="1000"></textarea></div></div><button class="btn" style="margin-top:18px" {'disabled' if not vehicles else ''}>Kosten speichern</button></form></section><section class="section card"><div class="section-head"><h2>Erfasste weitere Kosten</h2><span class="badge">{len(expenses)} Einträge</span></div><div class="table-wrap"><table><thead><tr><th>Datum</th><th>Fahrzeug</th><th>Kategorie</th><th>Beschreibung</th><th>Betrag</th><th></th></tr></thead><tbody>{rows or '<tr><td colspan="6" class="empty">Noch keine weiteren Fahrzeugkosten erfasst.</td></tr>'}</tbody></table></div></section><p class="muted">Gesamtkosten/km = alle Tankkosten + alle hier erfassten Kosten, geteilt durch die Strecke zwischen dem kleinsten und größten Kilometerstand der Tankungen.</p>"""
+        self.send_html(page("Fahrzeugkosten", body, "/vehicle-costs", notice))
+
+    def save_vehicle_cost(self, form):
+        vehicle_id = int(form.get("vehicle_id", 0))
+        incurred_on = parse_iso_date(form.get("incurred_on"))
+        category = str(form.get("category", "")).strip()
+        amount = parse_num(form.get("amount"))
+        description = str(form.get("description", "")).strip()
+        note = str(form.get("note", "")).strip()
+        if not incurred_on or category not in VEHICLE_COST_CATEGORIES or amount is None or amount <= 0:
+            raise ValueError("Bitte Fahrzeug, Datum, Kategorie und einen positiven Betrag prüfen.")
+        if len(description) > 160 or len(note) > 1000:
+            raise ValueError("Beschreibung oder Bemerkung ist zu lang.")
+        with connect() as db:
+            if not db.execute("SELECT 1 FROM vehicles WHERE id=?", (vehicle_id,)).fetchone():
+                raise ValueError("Fahrzeug nicht gefunden.")
+            db.execute(
+                "INSERT INTO vehicle_expenses(vehicle_id,incurred_on,category,description,amount,note) VALUES(?,?,?,?,?,?)",
+                (vehicle_id, incurred_on, category, description, round(amount, 2), note),
+            )
+        self.redirect("/vehicle-costs?notice=" + urllib.parse.quote("Fahrzeugkosten wurden gespeichert."))
+
+    def delete_vehicle_cost(self, expense_id):
+        with connect() as db:
+            db.execute("DELETE FROM vehicle_expenses WHERE id=?", (expense_id,))
+        self.redirect("/vehicle-costs?notice=" + urllib.parse.quote("Fahrzeugkosten wurden gelöscht."))
 
     def import_page(self, notice):
         token = self.cookie_token()
@@ -1459,6 +2208,62 @@ class Handler(BaseHTTPRequestHandler):
                     skipped += 1
         self.redirect("/fuelings?notice=" + urllib.parse.quote(f"{inserted} Tankungen importiert, {skipped} bereits vorhanden."))
 
+    def compare_page(self, query):
+        today = date.today()
+        default_a_start, default_a_end = date(today.year, 1, 1), today
+        try:
+            default_b_start = default_a_start.replace(year=today.year - 1)
+            default_b_end = default_a_end.replace(year=today.year - 1)
+        except ValueError:
+            default_b_start, default_b_end = date(today.year - 1, 1, 1), date(today.year - 1, 2, 28)
+        starts = [parse_iso_date(query.get("a_start", [default_a_start.isoformat()])[0]), parse_iso_date(query.get("b_start", [default_b_start.isoformat()])[0])]
+        ends = [parse_iso_date(query.get("a_end", [default_a_end.isoformat()])[0]), parse_iso_date(query.get("b_end", [default_b_end.isoformat()])[0])]
+        if not all(starts + ends) or starts[0] > ends[0] or starts[1] > ends[1]:
+            raise ValueError("Bitte gültige Vergleichszeiträume wählen.")
+        summaries = []
+        with connect() as db:
+            for start_on, end_on in zip(starts, ends):
+                consumption = {metric: allocated_usage(db, metric, start_on, end_on)[0] for metric in METRICS}
+                summaries.append((consumption, energy_finances(db, start_on, end_on)))
+        rows = ""
+        for metric in ("grid_import", "pv_self", "gas", "water"):
+            cfg = METRICS[metric]
+            a_consumption, b_consumption = summaries[0][0].get(metric, 0.0), summaries[1][0].get(metric, 0.0)
+            delta = comparison_difference(a_consumption, b_consumption)
+            if delta["percent"] is None:
+                percent_text = "Prozent nicht berechenbar (A = 0)"
+            else:
+                percent_text = f'{delta["percent"]:+.2f} %'.replace(".", ",")
+            delta_html = f'<span class="comparison-delta {delta["css"]}">{fmt_num(abs(delta["difference"]))} {esc(cfg["unit"])} {delta["label"]}<span class="comparison-percent">{percent_text}</span></span>'
+            if metric == "pv_self":
+                rows += f"<tr><td>{cfg['icon']} {esc(cfg['label'])}</td><td>{fmt_num(a_consumption)} {cfg['unit']}</td><td>{fmt_num(b_consumption)} {cfg['unit']}</td><td>{delta_html}</td><td colspan='8' class='muted'>PV wird nicht mit Versorgerkosten oder Abschlägen verrechnet.</td></tr>"
+                continue
+            a = summaries[0][1].get(metric, settlement_values())
+            b = summaries[1][1].get(metric, settlement_values())
+            rows += f"<tr><td>{cfg['icon']} <strong>{esc(cfg['label'])}</strong></td><td>{fmt_num(a_consumption)} {cfg['unit']}</td><td>{fmt_num(b_consumption)} {cfg['unit']}</td><td>{delta_html}</td><td>{fmt_money(a['variable'])}</td><td>{fmt_money(b['variable'])}</td><td>{fmt_money(a['base_fee'])}</td><td>{fmt_money(b['base_fee'])}</td><td>{fmt_money(a['cost'])}</td><td>{fmt_money(b['cost'])}</td><td>{fmt_money(a['balance'])}</td><td>{fmt_money(b['balance'])}</td></tr>"
+        body = f"""<div class="topbar"><div><h1>Vergleich</h1><div class="subtitle">Verbrauch, Kosten und Abrechnungssaldo zweier frei wählbarer Zeiträume</div></div></div><div class="card"><form method="get"><div class="form-grid"><div class="field"><label>Zeitraum A von</label><input type="date" name="a_start" value="{starts[0]}"></div><div class="field"><label>bis</label><input type="date" name="a_end" value="{ends[0]}"></div><div class="field"><label>Zeitraum B von</label><input type="date" name="b_start" value="{starts[1]}"></div><div class="field"><label>bis</label><input type="date" name="b_end" value="{ends[1]}"></div></div><button class="btn" style="margin-top:18px">Vergleichen</button></form></div><section class="section card table-wrap"><table><thead><tr><th>Bereich</th><th>Verbrauch A</th><th>Verbrauch B</th><th>Differenz B − A</th><th>Verbrauchskosten A</th><th>Verbrauchskosten B</th><th>Grundpreis A</th><th>Grundpreis B</th><th>Gesamtkosten A</th><th>Gesamtkosten B</th><th>Guthaben/Nachzahlung A</th><th>Guthaben/Nachzahlung B</th></tr></thead><tbody>{rows}</tbody></table><p class="muted">Die Differenz zeigt Zeitraum B im Vergleich zu Zeitraum A. Saldo = tatsächlich angesetzte Abschläge − (Verbrauchskosten + anteiliger Grundpreis).</p></section>"""
+        self.send_html(page("Vergleich", body, "/compare"))
+
+    def settings_page(self, notice):
+        body = f"""<div class="topbar"><div><h1>Einstellungen</h1><div class="subtitle">Datenexport und automatischer Import</div></div></div><div class="grid"><div class="card"><h2>Excel-Export</h2><p class="muted">Enthält Übersicht, Messwerte und Tarife. In der Übersicht werden Verbrauchskosten, Grundpreis, Gesamtkosten, Abschläge und Guthaben/Nachzahlung getrennt ausgegeben.</p><a class="btn" href="/export/energylab.xlsx">XLSX herunterladen</a></div><div class="card"><h2>Automatischer Import</h2><p>Nächster täglicher Lauf: <strong>{SYNC_HOUR:02d}:{SYNC_MINUTE:02d} Uhr</strong></p><p class="muted">Der Zeitpunkt lässt sich im Portainer-Stack über ENERGYLAB_SYNC_HOUR und ENERGYLAB_SYNC_MINUTE ändern.</p></div></div>"""
+        self.send_html(page("Einstellungen", body, "/settings", notice))
+
+    def export_xlsx(self):
+        with connect() as db:
+            finances = energy_finances(db)
+            overview = [["Bereich", "Verbrauchskosten", "Grundpreis", "Gesamtkosten", "Gezahlte Abschläge", "Guthaben (+) / Nachzahlung (-)"]]
+            for metric in ("grid_import", "gas", "water"):
+                values = finances.get(metric, settlement_values())
+                overview.append([METRICS[metric]["label"], values["variable"], values["base_fee"], values["cost"], values["advance"], values["balance"]])
+            overview.append([])
+            overview.append(["Rechenregel", "Guthaben/Nachzahlung = gezahlte Abschläge - (Verbrauchskosten + anteiliger Grundpreis)"])
+            readings = [["Messgröße", "Datum", "Zählerstand", "Verbrauch", "Einheit", "Gültig", "Ausschlussgrund", "Quelle"]]
+            readings += [[r["metric"], r["read_on"], r["total_value"], r["delta_value"] if r["delta_value"] is not None else "", r["unit"], r["is_valid"], r["invalid_reason"], r["source"]] for r in db.execute("SELECT * FROM energy_readings ORDER BY metric,read_on,id")]
+            tariffs = [["Messgröße", "Anbieter", "Gültig von", "Gültig bis", "Arbeitspreis €/kWh bzw. €/m³", "kWh je Einheit", "Grundpreis €/Monat", "Abschlag €/Monat"]]
+            tariffs += [[r["metric"], r["provider"], r["valid_from"], r["valid_to"] or "", r["price_per_kwh"], r["kwh_per_unit"], r["base_fee_monthly"], r["advance_monthly"]] for r in db.execute("SELECT * FROM energy_tariffs ORDER BY metric,valid_from,id")]
+        data = build_xlsx([("Übersicht", overview), ("Messwerte", readings), ("Tarife", tariffs)])
+        self.send_bytes(data, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f'attachment; filename="energylab-export-{date.today()}.xlsx"'})
+
     def support_page(self):
         if COFFEE_URL.startswith(("https://", "http://")):
             coffee = f'<a class="btn coffee" href="{esc(COFFEE_URL)}" target="_blank" rel="noopener noreferrer">☕ Buy me a coffee</a>'
@@ -1475,6 +2280,7 @@ class Handler(BaseHTTPRequestHandler):
                 "vehicles": [dict(r) for r in db.execute("SELECT * FROM vehicles")],
                 "vehicle_fluids": [dict(r) for r in db.execute("SELECT * FROM vehicle_fluids")],
                 "fuelings": [dict(r) for r in db.execute("SELECT * FROM fuelings")],
+                "vehicle_expenses": [dict(r) for r in db.execute("SELECT * FROM vehicle_expenses")],
                 "energy_readings": [dict(r) for r in db.execute("SELECT * FROM energy_readings")],
                 "energy_tariffs": [dict(r) for r in db.execute("SELECT * FROM energy_tariffs")],
             }
