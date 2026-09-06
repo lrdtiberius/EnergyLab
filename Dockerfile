@@ -1,12 +1,13 @@
 FROM python:3.13-alpine
 
+LABEL org.opencontainers.image.title="EnergyLab" \
+      org.opencontainers.image.version="0.6.6"
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     ENERGYLAB_HOST=0.0.0.0 \
     ENERGYLAB_PORT=8090 \
-    ENERGYLAB_DATA_DIR=/data \
-    ENERGYLAB_SYNC_HOUR=23 \
-    ENERGYLAB_SYNC_MINUTE=30
+    ENERGYLAB_DATA_DIR=/data
 
 RUN apk add --no-cache tzdata \
     && addgroup -S energylab \

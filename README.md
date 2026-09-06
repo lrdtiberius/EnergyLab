@@ -1,19 +1,21 @@
 # EnergyLab
 
-EnergyLab ist ein schlankes, lokal betriebenes Dashboard für Energie-, Wasser- und Fahrzeugdaten. Die Anwendung läuft als einzelner Docker-Container, speichert ihre Daten in SQLite und kann Zählerstände aus Home Assistant übernehmen.
+EnergyLab ist ein schlankes, lokal betriebenes Dashboard für Energie-, Wasser-, Abwasser- und Fahrzeugdaten. Die Anwendung läuft als einzelner Docker-Container, speichert ihre Daten in SQLite und kann Zählerstände aus Home Assistant übernehmen.
 
-## Release 0.6.1
+## Release 0.6.6
 
-Die Detailansichten von Strom, PV-Eigenverbrauch, Gas und Wasser lassen sich jetzt monatsweise durchblättern:
+EnergyLab 0.6.6 erweitert die Verbrauchs- und Vertragsverwaltung:
 
-- vorherige Monate direkt in der jeweiligen Energieansicht öffnen
-- bis zum aktuellen Monat wieder vorwärts navigieren
-- mit **„Zum aktuellen Monat“** aus jeder historischen Ansicht direkt zurückspringen
-- Verbrauch, Kosten, Messwerte und Diagramme passend zum gewählten Monat berechnen
-- zukünftige Monate automatisch sperren
-- Abrechnungshochrechnung nur dort anzeigen, wo sie fachlich sinnvoll ist
+- eigene Bereiche für Strom, Gas, Wasser und Abwasser
+- Abwasserverbrauch automatisch aus dem Wasserzähler, aber mit eigenem Tarif und eigenen Zahlungen
+- monatliche, quartalsweise, halbjährliche oder jährliche Zahlungen mit frei wählbarem Zahlungstag und optionalem Datum der ersten Zahlung
+- spätere Zahlungsänderungen mit Gültigkeitsmonat, ohne alte Zahlungen oder Verträge umzuschreiben
+- Kontoübergabe und Zahlungstermine für die automatische Übernahme durch FinanzLab
+- manuelle, auch rückwirkende Zählerstände für Strom, Gas und Wasser
+- Verbrauchsdifferenz im Zeitraumvergleich und vollständiger Zählerstände-Export
+- Grundpreis und Zahlungsbetrag in Monatsansichten als volle Monatswerte
 
-Die Version 0.6.1 ist ein vollständiges Standalone-Release und benötigt keinen Patch sowie keine ältere Programmversion. Beim Update bleibt das vorhandene Docker-Volume erhalten.
+Die Version 0.6.6 ist ein vollständiges Standalone-Release und benötigt keinen Patch sowie keine ältere Programmversion. Beim Update bleibt das vorhandene Docker-Volume erhalten.
 
 ## Installation und Einrichtung
 
@@ -21,18 +23,19 @@ Die vollständige Schritt-für-Schritt-Anleitung für Portainer, Docker Compose,
 
 ## Funktionen
 
-- Dashboard für Strom, PV-Eigenverbrauch, Gas und Wasser
+- eigene Übersichten für Strom, PV-Eigenverbrauch, Gas, Wasser und Abwasser
 - Tages-, Monats- und Jahresauswertungen mit Detailtabellen und Diagrammen
 - Plausibilitätsprüfung für Nullwerte, Zählerrücksprünge und unrealistische Sprünge
 - Home-Assistant-Synchronisierung und Import vorhandener Langzeitstatistiken
 - automatische Synchronisierung täglich um 23:30 Uhr in `Europe/Berlin`
 - sichtbarer Datenstand mit Datum und Uhrzeit
-- Tarifzeiträume mit Anbieter, Verbrauchspreis, Grundpreis und Abschlag
+- historisch korrekte Tarifzeiträume mit Anbieter, Verbrauchspreis, monatlichem Grundpreis und Zahlungen
+- Zahlungsrhythmus, Zahlungstag, erste Zahlung und FinanzLab-Konto je Vertrag
 - Abrechnungsvorschau mit Erstattung oder Nachzahlung
 - PV-Ersparnis als separate negative Position, ohne die tatsächlichen Stromkosten zu reduzieren
-- Wasserzähler mit manuellen, auch rückwirkenden Ablesungen
-- Zeitraums- und Vorjahresvergleich
-- Excel-Export unter Einstellungen
+- manuelle, auch rückwirkende Zählerstände für Strom, Gas und Wasser
+- Zeitraums- und Vorjahresvergleich einschließlich Verbrauchsdifferenz
+- Excel-Export einschließlich aller automatischen und manuellen Zählerstände
 - Fahrzeug-, Tank- und Betriebskostenverwaltung
 
 ## Start mit Docker Compose

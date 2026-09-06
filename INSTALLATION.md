@@ -1,6 +1,6 @@
-# EnergyLab 0.6.1 installieren und einrichten
+# EnergyLab 0.6.6 installieren und einrichten
 
-Diese Anleitung beschreibt die vollständige Erstinstallation und das Update einer bestehenden EnergyLab-Installation. Version 0.6.1 ist ein Standalone-Release und benötigt keinen Patch und keine frühere Programmversion.
+Diese Anleitung beschreibt die vollständige Erstinstallation und das Update einer bestehenden EnergyLab-Installation. Version 0.6.6 ist ein Standalone-Release und benötigt keinen Patch und keine frühere Programmversion.
 
 ## 1. Voraussetzungen
 
@@ -8,7 +8,7 @@ Diese Anleitung beschreibt die vollständige Erstinstallation und das Update ein
 - ein dauerhaftes Docker-Volume für die SQLite-Datenbank
 - für die automatische Energieübernahme: Home Assistant im selben Netzwerk
 - drei fortlaufende Home-Assistant-Zähler sind möglich: Strombezug, PV-Eigenverbrauch und Gas
-- Wasser wird ausschließlich manuell erfasst
+- Wasserstände werden manuell erfasst; derselbe Zähler liefert automatisch die Verbrauchsmenge für Abwasser
 
 EnergyLab besitzt keine Benutzeranmeldung. Verwende es im vertrauenswürdigen Heimnetz. Für einen Zugriff aus dem Internet sollte ein vorgeschalteter Reverse Proxy mit Anmeldung oder ein VPN eingesetzt werden; Port 8090 sollte nicht ungeschützt ins Internet freigegeben werden.
 
@@ -16,13 +16,13 @@ EnergyLab besitzt keine Benutzeranmeldung. Verwende es im vertrauenswürdigen He
 
 ### 2.1 Image bauen
 
-1. Lade `energylab-portainer-upload-0.6.1.tar.gz` herunter.
+1. Lade `energylab-portainer-build-v0.6.6-clean.tar.gz` herunter.
 2. Öffne in Portainer **Images**.
 3. Wähle **Build a new image** und anschließend den Upload eines Archivs.
-4. Vergib den Namen `energylab:0.6.1`.
+4. Vergib den Namen `energylab:0.6.6`.
 5. Lade das Archiv hoch und starte den Build.
 
-Das Archiv enthält den vollständigen Stand von EnergyLab 0.6.1 sowie den Docker-Buildkontext. Es ist kein älteres Image erforderlich.
+Das Archiv enthält den vollständigen Stand von EnergyLab 0.6.6 sowie den Docker-Buildkontext. Es ist kein älteres Image erforderlich.
 
 ### 2.2 Stack anlegen
 
@@ -31,7 +31,7 @@ Lege unter **Stacks → Add stack** beispielsweise den Stack `energylab` mit fol
 ```yaml
 services:
   energylab:
-    image: energylab:0.6.1
+    image: energylab:0.6.6
     container_name: energylab
     restart: unless-stopped
     ports:
@@ -53,7 +53,7 @@ volumes:
   energylab_data:
 ```
 
-Ersetze IP-Adresse, Token und Sensor-IDs durch deine eigenen Werte. Nicht verwendete Sensorvariablen dürfen leer bleiben. Veröffentliche deinen Token niemals in GitHub, Screenshots oder Supportanfragen.
+Ersetze Hostnamen, Token und Sensor-IDs durch deine eigenen Werte. Nicht verwendete Sensorvariablen dürfen leer bleiben. Veröffentliche deinen Token niemals in GitHub, Screenshots oder Supportanfragen.
 
 ### 2.3 Stack starten
 
@@ -144,42 +144,50 @@ Der laufende Container prüft den Termin einmal pro Minute und führt pro Kalend
 
 ## 8. Tarife und Verträge einrichten
 
-EnergyLab unterstützt jeweils bis zu fünf Strom-, Gas- und Wassertarife. Für jeden Tarif werden Anbieter, Gültigkeitszeitraum, Verbrauchspreis, Grundpreis und Abschlag hinterlegt. Tarifzeiträume dürfen sich innerhalb derselben Energieart nicht überschneiden.
+EnergyLab unterstützt jeweils bis zu fünf Strom-, Gas-, Wasser- und Abwassertarife. Für jeden Vertrag werden Anbieter, Gültigkeitszeitraum, Verbrauchspreis, Grundpreis und Zahlungsbetrag hinterlegt. Tarifzeiträume dürfen sich innerhalb derselben Energieart nicht überschneiden.
+
+Zusätzlich kannst du den Zahlungsrhythmus, den Zahlungstag, das optionale Datum **Erste Zahlung** und den exakten Kontonamen aus FinanzLab speichern. Die erste Zahlung dient als Rhythmusanker, wenn die tatsächliche erste Fälligkeit nicht dem rechnerischen Termin ab Vertragsbeginn entspricht. Ändert sich später nur der Betrag, verwende im bestehenden Vertrag **Neuer Betrag gültig ab Monat**. So bleiben frühere Zahlungen historisch korrekt erhalten.
 
 ### Strom
 
 - Arbeitspreis in **Cent/kWh**, zum Beispiel `32,90`
 - Grundpreis in **€/Monat**
-- Abschlag in **€/Monat**
+- Betrag je Zahlung und Zahlungsrhythmus
 
 ### Gas
 
 - Arbeitspreis in **Cent/kWh**
 - Umrechnungsfaktor in **kWh/m³** aus der Gasabrechnung
-- Grundpreis und Abschlag in **€/Monat**
+- Grundpreis in **€/Monat** sowie Betrag je Zahlung und Zahlungsrhythmus
 
 EnergyLab rechnet den gemessenen m³-Verbrauch mit dem zum jeweiligen Vertragszeitraum gehörenden Faktor in kWh um.
 
 ### Wasser
 
 - Verbrauchspreis in **€/m³**
-- Grundpreis und Abschlag in **€/Monat**
+- Grundpreis in **€/Monat** sowie Betrag je Zahlung und Zahlungsrhythmus
 
-Für die vollständigen variablen Wasserkosten kann der eingetragene Preis Trinkwasser und Abwasser zusammenfassen.
+### Abwasser
+
+- Verbrauchspreis in **€/m³**
+- eigener Grundpreis, eigener Zahlungsbetrag und eigener Zahlungsrhythmus
+- kein zusätzlicher Sensor: Die Verbrauchsmenge wird automatisch aus dem Wasserzähler übernommen
+
+Wasser- und Abwasserkosten bleiben getrennt. Der Wasserpreis darf deshalb nur die Trinkwasserkosten enthalten.
 
 Die Abrechnungsvorschau berechnet:
 
 ```text
-Verbrauchskosten + anteiliger Grundpreis = Gesamtkosten
-Abschläge − Gesamtkosten = Guthaben oder Nachzahlung
+Verbrauchskosten + Grundpreis der berührten Kalendermonate = Gesamtkosten
+Tatsächlich angesetzte Zahlungen − Gesamtkosten = Guthaben oder Nachzahlung
 ```
 
-Für eine Hochrechnung werden ein Tarif-Enddatum und mindestens zwei gültige Zählerstände benötigt.
+Für eine Hochrechnung werden ein Tarif-Enddatum und mindestens zwei gültige Zählerstände benötigt. Der monatliche Grundpreis wird nicht tageweise gekürzt. Auch in einem noch nicht abgeschlossenen Monat zeigt die Monatsansicht den vollständigen Monatsgrundpreis und den vollständigen fälligen Zahlungsbetrag. Quartals- oder Jahreszahlungen werden nur in den nach Rhythmus und erster Zahlung fälligen Monaten angesetzt.
 
-## 9. Wasserstände manuell erfassen
+## 9. Zählerstände manuell erfassen
 
-1. Öffne die Seite **Energie**.
-2. Trage Ablesedatum und Zählerstand in m³ ein.
+1. Öffne **Strom**, **Gas** oder **Wasser**.
+2. Trage Ablesedatum und Zählerstand ein.
 3. Speichere den Stand.
 
 Rückwirkende Werte sind erlaubt. Ein älterer Stand darf niedriger als der heutige Startwert sein, muss aber zeitlich und wertmäßig zwischen einem eventuell vorhandenen früheren und späteren Zählerstand liegen. Nach einer rückwirkenden Eingabe berechnet EnergyLab alle betroffenen Verbrauchsdifferenzen neu.
@@ -188,13 +196,13 @@ Eine Eingabe für ein bereits gespeichertes Datum korrigiert genau diesen Tagesw
 
 ## 10. Monatsansichten und direkter Rücksprung
 
-Klicke im Dashboard auf Strom, PV, Gas oder Wasser und wähle **Monat**. Mit den Pfeilen wechselst du durch die vorhandenen Monate. Aus einem historischen Monat führt **Zum aktuellen Monat** mit einem Klick zurück zur aktuellen Übersicht. Zukünftige Monate sind gesperrt.
+Klicke im Dashboard auf Strom, PV, Gas, Wasser oder Abwasser und wähle **Monat**. Mit den Pfeilen wechselst du durch die vorhandenen Monate. Aus einem historischen Monat führt **Zum aktuellen Monat** mit einem Klick zurück zur aktuellen Übersicht. Zukünftige Monate sind gesperrt.
 
 ## 11. Vergleich und Export
 
-Unter **Vergleich** lassen sich zwei frei wählbare Zeiträume gegenüberstellen. Angezeigt werden Verbrauch, Verbrauchskosten, Grundpreis, Gesamtkosten sowie Guthaben oder Nachzahlung.
+Unter **Vergleich** lassen sich zwei frei wählbare Zeiträume gegenüberstellen. Angezeigt werden Verbrauch und dessen Differenz, Verbrauchskosten, Grundpreis, Gesamtkosten sowie Guthaben oder Nachzahlung.
 
-Unter **Einstellungen** steht ein Excel-Export mit Übersicht, Messwerten und Tarifen bereit. Unter **Unterstützung** können zusätzlich ein vollständiges JSON-Backup und die Tankungen als CSV exportiert werden.
+Unter **Einstellungen** steht ein Excel-Export mit Übersicht, Tarifen sowie allen automatisch und manuell erfassten Zählerständen bereit. Unter **Unterstützung** können zusätzlich ein vollständiges JSON-Backup und die Tankungen als CSV exportiert werden.
 
 ## 12. Datensicherung
 
@@ -209,7 +217,7 @@ Das Volume enthält die SQLite-Datenbank unter `/data/energylab.sqlite3`.
 ## 13. Update einer bestehenden Installation
 
 1. Erstelle zuerst ein JSON-Backup.
-2. Baue das neue Standalone-Archiv unter einem neuen Image-Namen, zum Beispiel `energylab:0.6.1`, oder ziehe `ghcr.io/lrdtiberius/energylab:latest` neu.
+2. Baue das neue Standalone-Archiv unter einem neuen Image-Namen, zum Beispiel `energylab:0.6.6`, oder ziehe `ghcr.io/lrdtiberius/energylab:latest` neu.
 3. Ändere ausschließlich den Image-Namen im Stack.
 4. Aktualisiere den Stack.
 5. Behalte das vorhandene Volume `energylab_data` unverändert bei.

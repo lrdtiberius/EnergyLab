@@ -277,6 +277,11 @@ class EnergyLabTests(unittest.TestCase):
             )
 
         class PageCapture:
+            energy_metric_management = app.Handler.energy_metric_management
+
+            def cookie_token(self):
+                return "test-session"
+
             def send_html(self, html, *args, **kwargs):
                 self.html = html
 
