@@ -33,7 +33,8 @@ from socketserver import ThreadingMixIn
 
 
 APP_NAME = "EnergieLab"
-APP_VERSION = "0.6.6"
+APP_VERSION = "1.2.2"
+ASSET_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("ENERGYLAB_DATA_DIR", "/data"))
 DB_PATH = DATA_DIR / "energylab.sqlite3"
 HOST = os.getenv("ENERGYLAB_HOST", "0.0.0.0")
@@ -47,6 +48,26 @@ TARIFF_LIMIT = 5
 SYNC_HOUR = int(os.getenv("ENERGYLAB_SYNC_HOUR", "23"))
 SYNC_MINUTE = int(os.getenv("ENERGYLAB_SYNC_MINUTE", "30"))
 MAX_PERIOD_CROSSING_GAP_DAYS = int(os.getenv("ENERGYLAB_MAX_PERIOD_CROSSING_GAP_DAYS", "62"))
+FINANZLAB_URL = os.getenv("FINANZLAB_URL", "").strip().rstrip("/")
+FINANZLAB_HOUSEHOLD_ID = os.getenv("FINANZLAB_HOUSEHOLD_ID", "").strip()
+FINANZLAB_TOKEN = os.getenv("FINANZLAB_TOKEN", "").strip()
+BACKUP_DIR = DATA_DIR / "backups"
+BACKUP_RETENTION = max(3, int(os.getenv("ENERGYLAB_BACKUP_RETENTION", "12")))
+
+SEGMENT_BY_METRIC = {
+    "grid_import": "electricity",
+    "gas": "gas",
+    "water": "water",
+    "wastewater": "wastewater",
+}
+PAYMENT_EVENT_LABELS = {
+    "regular_payment": "Abschlagszahlung",
+    "one_off_payment": "Einmalzahlung",
+    "suspension": "Zahlung ausgesetzt",
+    "chargeback": "Rücklastschrift",
+    "credit_payout": "Guthabenauszahlung",
+    "correction": "Korrektur",
+}
 
 # Generous household safety limits. Gaps are multiplied by their day count.
 MAX_DAILY_CHANGE = {
@@ -155,16 +176,121 @@ def parse_iso_date(value: str) -> str | None:
         return None
 
 
+class ClosingConnection(sqlite3.Connection):
+    """Commit or roll back like sqlite3, then also release the file handle."""
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
 def connect() -> sqlite3.Connection:
-    db = sqlite3.connect(DB_PATH, timeout=20)
+    db = sqlite3.connect(DB_PATH, timeout=20, factory=ClosingConnection)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA foreign_keys=ON")
     db.execute("PRAGMA journal_mode=WAL")
     return db
 
 
+def get_meta(key: str, default="", db=None) -> str:
+    """Read one setting without forcing callers to manage a connection."""
+    owns_connection = db is None
+    db = db or connect()
+    try:
+        row = db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else default
+    except sqlite3.OperationalError:
+        return default
+    finally:
+        if owns_connection:
+            db.close()
+
+
+def set_meta(key: str, value, db=None) -> None:
+    owns_connection = db is None
+    db = db or connect()
+    try:
+        db.execute(
+            """INSERT INTO meta(key,value) VALUES(?,?)
+               ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+            (key, str(value)),
+        )
+        if owns_connection:
+            db.commit()
+    finally:
+        if owns_connection:
+            db.close()
+
+
+def _installed_version() -> str:
+    if not DB_PATH.exists() or DB_PATH.stat().st_size == 0:
+        return ""
+    try:
+        db = sqlite3.connect(DB_PATH)
+        try:
+            row = db.execute("SELECT value FROM meta WHERE key='app_version'").fetchone()
+            return str(row[0]) if row else "legacy"
+        finally:
+            db.close()
+    except sqlite3.Error:
+        return "legacy"
+
+
+def create_automatic_backup(reason="manual") -> Path | None:
+    """Create a consistent SQLite copy and retain a bounded local history."""
+    if not DB_PATH.exists() or DB_PATH.stat().st_size == 0:
+        return None
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    safe_reason = "".join(ch if ch.isalnum() or ch in "-_" else "-" for ch in str(reason))[:48] or "backup"
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    target = BACKUP_DIR / f"energylab-{safe_reason}-{stamp}.sqlite3"
+    source = sqlite3.connect(DB_PATH, timeout=20)
+    destination = sqlite3.connect(target)
+    try:
+        source.backup(destination)
+        if destination.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            raise RuntimeError("Die Sicherung hat die Integritätsprüfung nicht bestanden.")
+    finally:
+        destination.close()
+        source.close()
+    backups = sorted(BACKUP_DIR.glob("energylab-*.sqlite3"), key=lambda path: path.stat().st_mtime, reverse=True)
+    for old_backup in backups[BACKUP_RETENTION:]:
+        old_backup.unlink(missing_ok=True)
+    return target
+
+
+def restore_database_backup(filename: str) -> Path:
+    """Restore a generated local backup after validation and a safety backup."""
+    source_path = BACKUP_DIR / Path(str(filename)).name
+    if source_path.parent != BACKUP_DIR or not source_path.is_file() or not source_path.name.startswith("energylab-"):
+        raise ValueError("Sicherung nicht gefunden.")
+    source = sqlite3.connect(f"file:{source_path}?mode=ro", uri=True)
+    try:
+        if source.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            raise ValueError("Die gewählte Sicherung ist beschädigt.")
+        tables = {row[0] for row in source.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if not {"meta", "energy_readings", "energy_tariffs"}.issubset(tables):
+            raise ValueError("Die Datei ist keine gültige EnergieLab-Sicherung.")
+        safety = create_automatic_backup("vor-wiederherstellung")
+        destination = sqlite3.connect(DB_PATH, timeout=20)
+        try:
+            source.backup(destination)
+        finally:
+            destination.close()
+    finally:
+        source.close()
+    init_db()
+    return safety or source_path
+
+
 def init_db() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    previous_version = _installed_version()
+    upgrade_backup = None
+    if previous_version and previous_version != APP_VERSION:
+        upgrade_backup = create_automatic_backup(f"vor-update-{previous_version}-auf-{APP_VERSION}")
     with connect() as db:
         db.executescript(
             """
@@ -257,6 +383,72 @@ def init_db() -> None:
                 status TEXT NOT NULL,
                 message TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS energy_payment_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                external_id TEXT,
+                tariff_id INTEGER REFERENCES energy_tariffs(id) ON DELETE SET NULL,
+                segment_id TEXT NOT NULL DEFAULT '',
+                due_on TEXT,
+                booked_on TEXT NOT NULL,
+                amount REAL NOT NULL DEFAULT 0,
+                event_type TEXT NOT NULL CHECK(event_type IN ('regular_payment','one_off_payment','suspension','chargeback','credit_payout','correction')),
+                status TEXT NOT NULL DEFAULT 'paid',
+                source TEXT NOT NULL DEFAULT 'manual',
+                match_method TEXT NOT NULL DEFAULT '',
+                confidence REAL,
+                confirmed INTEGER NOT NULL DEFAULT 1,
+                note TEXT NOT NULL DEFAULT '',
+                raw_payload TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_energy_payment_events_external
+                ON energy_payment_events(external_id) WHERE external_id IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_energy_payment_events_tariff_date
+                ON energy_payment_events(tariff_id,booked_on,due_on);
+            CREATE TABLE IF NOT EXISTS energy_settlement_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tariff_id INTEGER NOT NULL REFERENCES energy_tariffs(id) ON DELETE RESTRICT,
+                revision INTEGER NOT NULL,
+                period_from TEXT NOT NULL,
+                period_to TEXT NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
+                payment_basis TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                payload_sha256 TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(tariff_id,period_from,period_to,revision)
+            );
+            CREATE INDEX IF NOT EXISTS idx_energy_settlement_snapshots_tariff
+                ON energy_settlement_snapshots(tariff_id,period_from,period_to,revision DESC);
+            CREATE TRIGGER IF NOT EXISTS energy_settlement_snapshots_no_update
+                BEFORE UPDATE ON energy_settlement_snapshots BEGIN
+                    SELECT RAISE(ABORT,'Fixierte Abrechnungen sind unveränderlich.');
+                END;
+            CREATE TRIGGER IF NOT EXISTS energy_settlement_snapshots_no_delete
+                BEFORE DELETE ON energy_settlement_snapshots BEGIN
+                    SELECT RAISE(ABORT,'Fixierte Abrechnungen sind unveränderlich.');
+                END;
+            CREATE TABLE IF NOT EXISTS integration_sync_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                integration TEXT NOT NULL,
+                direction TEXT NOT NULL DEFAULT 'pull',
+                status TEXT NOT NULL,
+                message TEXT NOT NULL,
+                imported_count INTEGER NOT NULL DEFAULT 0,
+                unresolved_count INTEGER NOT NULL DEFAULT 0,
+                details_json TEXT NOT NULL DEFAULT '{}',
+                synced_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_integration_sync_latest
+                ON integration_sync_log(integration,synced_at DESC,id DESC);
+            CREATE TABLE IF NOT EXISTS backup_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                filename TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'ok',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             """
         )
         tariff_columns = {row["name"] for row in db.execute("PRAGMA table_info(energy_tariffs)")}
@@ -299,6 +491,16 @@ def init_db() -> None:
         for metric in MAX_DAILY_CHANGE:
             sanitize_cumulative_readings(db, metric)
         db.execute("INSERT OR IGNORE INTO meta(key,value) VALUES('session_secret',?)", (secrets.token_hex(32),))
+        db.execute(
+            """INSERT INTO meta(key,value) VALUES('app_version',?)
+               ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+            (APP_VERSION,),
+        )
+        if upgrade_backup:
+            db.execute(
+                "INSERT INTO backup_log(filename,reason,status) VALUES(?,?, 'ok')",
+                (upgrade_backup.name, f"Automatisch vor Update von {previous_version} auf {APP_VERSION}"),
+            )
         if not db.execute("SELECT 1 FROM vehicles LIMIT 1").fetchone():
             cur = db.execute("INSERT INTO vehicles(name) VALUES(?)", ("VW T6.1",))
             for fluid in ("Diesel", "AdBlue"):
@@ -355,6 +557,31 @@ def period_bounds(period: str, reference: date | None = None):
     raise ValueError("Unbekannter Zeitraum.")
 
 
+ENERGY_DETAIL_VIEWS = ("overview", "contract", "payments", "imports")
+
+
+def normalize_energy_detail_view(value: str | None) -> str:
+    """Resolve friendly and legacy query values to a safe detail tab."""
+    normalized = str(value or "").strip().lower()
+    aliases = {
+        "": "overview",
+        "overview": "overview",
+        "uebersicht": "overview",
+        "übersicht": "overview",
+        "contract": "contract",
+        "vertrag": "contract",
+        "payments": "payments",
+        "payment": "payments",
+        "zahlungsplan": "payments",
+        "tilgungsplan": "payments",
+        "imports": "imports",
+        "import": "imports",
+        "historie": "imports",
+        "importhistorie": "imports",
+    }
+    return aliases.get(normalized, "overview")
+
+
 MONTH_NAMES_DE = (
     "",
     "Januar",
@@ -389,9 +616,74 @@ def shift_month(month_start: date, offset: int) -> date:
     return date(absolute // 12, absolute % 12 + 1, 1)
 
 
+def add_months_anchored(day: date, offset: int) -> date:
+    """Move a date by months while retaining its contractual day where possible."""
+    target = shift_month(day.replace(day=1), offset)
+    last_day = (shift_month(target, 1) - timedelta(days=1)).day
+    return target.replace(day=min(day.day, last_day))
+
+
+def sync_time(db=None) -> tuple[int, int]:
+    """Return the persisted import time, falling back to the environment."""
+    owns_connection = db is None
+    db = db or connect()
+    try:
+        row = db.execute("SELECT value FROM meta WHERE key='sync_time'").fetchone()
+        raw = row["value"] if row else f"{SYNC_HOUR:02d}:{SYNC_MINUTE:02d}"
+        parsed = datetime.strptime(raw, "%H:%M")
+        return parsed.hour, parsed.minute
+    except (TypeError, ValueError):
+        return SYNC_HOUR, SYNC_MINUTE
+    finally:
+        if owns_connection:
+            db.close()
+
+
 def reading_metric_for(metric: str) -> str:
     """Abwasser verwendet immer exakt die Messreihe des Wasserzählers."""
     return METRICS.get(metric, {}).get("reading_metric", metric)
+
+
+def active_energy_tariff(db, metric: str, reference: date | None = None):
+    """Return the tariff that is active on the reference day, independent of readings."""
+    today = reference or date.today()
+    today_text = today.isoformat()
+    return db.execute(
+        """SELECT * FROM energy_tariffs
+           WHERE metric=? AND valid_from<=?
+             AND (valid_to IS NULL OR valid_to>=?)
+           ORDER BY valid_from DESC,id DESC LIMIT 1""",
+        (metric, today_text, today_text),
+    ).fetchone()
+
+
+def tariff_display_sort_key(valid_from, valid_to=None, tariff_id=0, reference: date | None = None):
+    """Sort tariffs/sections as: active first, future next, ended last."""
+    today = reference or date.today()
+    start = date.fromisoformat(str(valid_from))
+    end = date.fromisoformat(str(valid_to)) if valid_to else None
+    ident = int(tariff_id or 0)
+    if start <= today and (end is None or today <= end):
+        return (0, -start.toordinal(), -ident)
+    if start > today:
+        return (1, start.toordinal(), ident)
+    ended_on = end or start
+    return (2, -ended_on.toordinal(), -start.toordinal(), -ident)
+
+
+def tariff_display_sort_key_for_row(tariff, reference: date | None = None):
+    return tariff_display_sort_key(
+        tariff["valid_from"],
+        tariff["valid_to"],
+        tariff["id"],
+        reference,
+    )
+
+
+def tariff_end_or_today(tariff, reference: date | None = None) -> str:
+    """Use a bounded end for open contracts without inventing future consumption."""
+    today = reference or date.today()
+    return tariff["valid_to"] or today.isoformat()
 
 
 def payment_recurrence(interval_months) -> str:
@@ -563,47 +855,559 @@ def calendar_months_touched(start_on: str, end_on: str) -> int:
     return (end.year - start.year) * 12 + end.month - start.month + 1
 
 
-def advance_for_period(db, tariff, start_on: str, end_on: str) -> float:
-    """Apply each scheduled payment in full; never prorate it by day."""
+def _row_value(row, key, default=None):
+    try:
+        return row[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+
+
+def scheduled_payment_events(db, tariff, start_on: str, end_on: str):
+    """Return a deterministic contractual schedule, including explicit suspensions."""
     period_start = date.fromisoformat(start_on)
     period_end = date.fromisoformat(end_on)
     if period_end < period_start:
-        return 0.0
+        return []
     changes = db.execute(
         """SELECT valid_from,advance_monthly FROM energy_advance_changes
            WHERE tariff_id=? ORDER BY valid_from,id""",
         (tariff["id"],),
     ).fetchall()
-    schedule = [(date.fromisoformat(tariff["valid_from"]).replace(day=1), float(tariff["advance_monthly"]))]
-    schedule.extend((date.fromisoformat(row["valid_from"]).replace(day=1), float(row["advance_monthly"])) for row in changes)
-    total = 0.0
-    cursor = period_start.replace(day=1)
-    final_month = period_end.replace(day=1)
-    first_payment = tariff["first_payment_date"] or tariff["valid_from"]
-    anchor_month = date.fromisoformat(first_payment).replace(day=1)
+    contract_start = date.fromisoformat(tariff["valid_from"])
+    contract_end = date.fromisoformat(tariff["valid_to"]) if tariff["valid_to"] else None
+    schedule = [(contract_start, float(tariff["advance_monthly"]))]
+    schedule.extend((date.fromisoformat(row["valid_from"]), float(row["advance_monthly"])) for row in changes)
     interval_months = int(tariff["payment_interval_months"] or 1)
-    while cursor <= final_month:
-        months_since_anchor = (cursor.year - anchor_month.year) * 12 + cursor.month - anchor_month.month
-        if months_since_anchor >= 0 and months_since_anchor % interval_months == 0:
-            applicable = [amount for effective_from, amount in schedule if effective_from <= cursor]
+    if tariff["first_payment_date"]:
+        anchor = date.fromisoformat(tariff["first_payment_date"])
+        preferred_day = anchor.day
+    else:
+        month = contract_start.replace(day=1)
+        preferred_day = int(tariff["payment_day"] or 1)
+        last_day = (shift_month(month, 1) - timedelta(days=1)).day
+        anchor = month.replace(day=min(preferred_day, last_day))
+        if anchor < contract_start:
+            target_month = shift_month(month, interval_months)
+            target_last_day = (shift_month(target_month, 1) - timedelta(days=1)).day
+            anchor = target_month.replace(day=min(preferred_day, target_last_day))
+    effective_end = min(value for value in (period_end, contract_end) if value is not None)
+    suspensions = {
+        row["due_on"] or row["booked_on"]
+        for row in db.execute(
+            """SELECT due_on,booked_on FROM energy_payment_events
+               WHERE tariff_id=? AND event_type='suspension'
+                 AND status NOT IN ('cancelled','reversed')""",
+            (tariff["id"],),
+        )
+    }
+    events = []
+    occurrence = 0
+    due = anchor
+    while due <= effective_end:
+        if due >= period_start and due >= contract_start:
+            applicable = [amount for effective_from, amount in schedule if effective_from <= due]
             if applicable:
-                total += applicable[-1]
-        cursor = shift_month(cursor, 1)
-    return total
+                due_text = due.isoformat()
+                suspended = due_text in suspensions
+                amount = 0.0 if suspended else float(applicable[-1])
+                segment_id = SEGMENT_BY_METRIC.get(tariff["metric"], tariff["metric"])
+                events.append({
+                    "id": f"energylab:advance:{segment_id}:{tariff['id']}:{due_text}",
+                    "sourceKey": f"energylab:advance:{segment_id}:{tariff['id']}",
+                    "segmentId": segment_id,
+                    "contractId": str(tariff["id"]),
+                    "dueOn": due_text,
+                    "plannedDate": due_text,
+                    "amount": amount,
+                    "amountCents": int(round(amount * 100)),
+                    "currency": "EUR",
+                    "status": "suspended" if suspended else "planned",
+                })
+        occurrence += interval_months
+        target_month = shift_month(anchor.replace(day=1), occurrence)
+        target_last_day = (shift_month(target_month, 1) - timedelta(days=1)).day
+        due = target_month.replace(day=min(preferred_day, target_last_day))
+    return events
 
 
-def settlement_values(variable=0.0, base_fee=0.0, advance=0.0):
+def advance_for_period(db, tariff, start_on: str, end_on: str) -> float:
+    """Sum scheduled payments actually due in the inclusive period."""
+    return sum(event["amount"] for event in scheduled_payment_events(db, tariff, start_on, end_on))
+
+
+def actual_payments_for_period(db, tariff, start_on: str, end_on: str, basis="cash"):
+    """Sum confirmed payments on either a cash or supplier-billing basis.
+
+    Cash views use the bank booking date.  A supplier statement instead uses the
+    explicitly matched due date first, falling back to the booking date only for
+    events that have no contractual allocation.  Keeping both views explicit is
+    important at a supplier switch, where a final instalment can be booked one or
+    two days after the old contract ended.
+    """
+    if basis not in ("cash", "billing"):
+        raise ValueError("Zahlungsbasis muss 'cash' oder 'billing' sein.")
+    period_column = (
+        "booked_on" if basis == "cash"
+        else "COALESCE(NULLIF(due_on,''),booked_on)"
+    )
+    rows = db.execute(
+        f"""SELECT * FROM energy_payment_events
+            WHERE tariff_id=? AND {period_column}>=? AND {period_column}<=?
+            ORDER BY {period_column},booked_on,id""",
+        (tariff["id"], start_on, end_on),
+    ).fetchall()
+    counted = []
+    ignored = []
+    for row in rows:
+        rejected = row["status"] in ("cancelled", "pending", "review", "ignored")
+        reversed_original = row["status"] == "reversed" and row["event_type"] not in (
+            "chargeback", "credit_payout", "correction"
+        )
+        if not row["confirmed"] or rejected or reversed_original:
+            ignored.append(dict(row))
+            continue
+        if row["event_type"] == "suspension":
+            continue
+        counted.append(dict(row))
+    planned = scheduled_payment_events(db, tariff, start_on, end_on)
+    # Only a regular payment or an explicit suspension fulfils a planned
+    # instalment.  Corrections, one-off payments and chargebacks are additive
+    # effects; treating one of them as the instalment itself would understate
+    # (or even invert) the paid amount during a partial bank import.
+    represented_due_dates = {
+        row["due_on"] or row["booked_on"] for row in rows
+        if row["confirmed"]
+        and row["event_type"] in ("regular_payment", "suspension")
+        and row["status"] not in ("cancelled", "pending", "review", "ignored", "reversed")
+    }
+    represented_days = [date.fromisoformat(value) for value in represented_due_dates if value]
+    missing_due_dates = [
+        event["plannedDate"] for event in planned
+        if not any(abs((candidate-date.fromisoformat(event["plannedDate"])).days) <= 3 for candidate in represented_days)
+    ]
+    complete = not missing_due_dates and (bool(rows) or not planned)
+    confirmed_suspension = any(
+        row["confirmed"]
+        and row["event_type"] == "suspension"
+        and row["status"] not in ("cancelled", "pending", "review", "ignored", "reversed")
+        for row in rows
+    )
+    return {
+        "amount": sum(float(row["amount"] or 0) for row in counted),
+        "count": len(counted),
+        # A pending or rejected import must never replace the contractual plan
+        # with zero.  A confirmed suspension, on the other hand, is a valid
+        # zero-payment result and therefore makes actual data available.
+        "available": bool(counted) or confirmed_suspension,
+        "complete": complete,
+        "missing_due_dates": missing_due_dates,
+        "events": counted,
+        "ignored": ignored,
+        "basis": basis,
+    }
+
+
+def payment_basis_for_period(db, tariff, start_on: str, end_on: str, basis="cash"):
+    """Combine confirmed payments with the plan for still-unmatched dues.
+
+    A bank import can be incomplete (for example, only the most recent month
+    was loaded).  Confirmed entries remain authoritative, while missing due
+    dates continue to use their contractual amount until they are matched.
+    This avoids turning every not-yet-imported instalment into an apparent
+    missed payment and a false projected additional payment.
+    """
+    planned_events = scheduled_payment_events(db, tariff, start_on, end_on)
+    planned_total = sum(float(event["amount"]) for event in planned_events)
+    actual = actual_payments_for_period(db, tariff, start_on, end_on, basis=basis)
+    missing = set(actual["missing_due_dates"])
+    missing_planned = sum(
+        float(event["amount"]) for event in planned_events
+        if event["plannedDate"] in missing
+    )
+    if not actual["available"]:
+        effective = planned_total
+        basis = "planned"
+    elif missing:
+        effective = float(actual["amount"]) + missing_planned
+        basis = "actual_plus_planned"
+    else:
+        effective = float(actual["amount"])
+        basis = "actual"
+    return {
+        "planned": planned_total,
+        "actual": float(actual["amount"]),
+        "actual_available": bool(actual["available"]),
+        "effective": effective,
+        "basis": basis,
+        "complete": bool(actual["complete"]),
+        "missing_due_dates": sorted(missing),
+        "missing_planned": missing_planned,
+        "events": actual["events"],
+        "ignored": actual["ignored"],
+    }
+
+
+def energy_payment_plan(db, metric: str, start_on=None, end_on=None, reference: date | None = None):
+    """Build read-only payment rows with their proportionate energy cost period.
+
+    Each contractual due date owns a non-overlapping consumption interval. Confirmed
+    bank events are matched by their explicit due date first and, for regular
+    payments without a due date, by a narrow booking-date window. Unmatched special
+    payments remain visible as separate rows instead of silently changing a plan.
+    """
+    if metric not in ("grid_import", "gas", "water", "wastewater"):
+        return []
+    today = reference or date.today()
+    filter_start = date.fromisoformat(start_on) if start_on else None
+    filter_end = date.fromisoformat(end_on) if end_on else None
+    reading_metric = reading_metric_for(metric)
+    rows = []
+
+    def event_is_counted(event) -> bool:
+        if not bool(event["confirmed"]):
+            return False
+        if event["status"] in ("cancelled", "pending", "review", "ignored"):
+            return False
+        return not (
+            event["status"] == "reversed"
+            and event["event_type"] not in ("chargeback", "credit_payout", "correction")
+        )
+
+    tariffs = db.execute(
+        "SELECT * FROM energy_tariffs WHERE metric=? ORDER BY valid_from,id", (metric,)
+    ).fetchall()
+    for tariff in tariffs:
+        contract_start = date.fromisoformat(tariff["valid_from"])
+        contract_end = date.fromisoformat(tariff["valid_to"]) if tariff["valid_to"] else None
+        # Open-ended contracts need a bounded, useful planning horizon.
+        horizon = filter_end or contract_end or date(today.year, 12, 31)
+        if horizon < contract_start:
+            continue
+        schedule = scheduled_payment_events(
+            db, tariff, tariff["valid_from"], horizon.isoformat()
+        )
+        actual_events = db.execute(
+            """SELECT * FROM energy_payment_events WHERE tariff_id=?
+               ORDER BY COALESCE(due_on,booked_on),booked_on,id""",
+            (tariff["id"],),
+        ).fetchall()
+        assigned_event_ids = set()
+
+        for index, planned in enumerate(schedule):
+            due = date.fromisoformat(planned["dueOn"])
+            if filter_start and due < filter_start:
+                continue
+            if filter_end and due > filter_end:
+                continue
+            next_due = (
+                date.fromisoformat(schedule[index + 1]["dueOn"])
+                if index + 1 < len(schedule)
+                else None
+            )
+            cost_start = contract_start if index == 0 else due
+            cost_end = (next_due - timedelta(days=1)) if next_due else horizon
+            if contract_end:
+                cost_end = min(cost_end, contract_end)
+            if filter_start:
+                cost_start = max(cost_start, filter_start)
+            if filter_end:
+                cost_end = min(cost_end, filter_end)
+
+            explicit = [
+                event for event in actual_events
+                if event["id"] not in assigned_event_ids and event["due_on"] == planned["dueOn"]
+            ]
+            matched = explicit
+            if not matched:
+                candidates = [
+                    event for event in actual_events
+                    if event["id"] not in assigned_event_ids
+                    and not event["due_on"]
+                    and event["event_type"] == "regular_payment"
+                    and abs((date.fromisoformat(event["booked_on"]) - due).days) <= 3
+                ]
+                if candidates:
+                    matched = [min(
+                        candidates,
+                        key=lambda event: (
+                            abs((date.fromisoformat(event["booked_on"]) - due).days),
+                            event["id"],
+                        ),
+                    )]
+            for event in matched:
+                assigned_event_ids.add(event["id"])
+
+            counted = [event for event in matched if event_is_counted(event)]
+            review = any(
+                not bool(event["confirmed"]) or event["status"] in ("pending", "review")
+                for event in matched
+            )
+            actual_available = bool(counted) or any(
+                event["event_type"] == "suspension" and event_is_counted(event)
+                for event in matched
+            )
+            actual_amount = (
+                sum(float(event["amount"] or 0) for event in counted) if actual_available else None
+            )
+            planned_amount = float(planned["amount"] or 0)
+
+            if cost_end >= cost_start:
+                consumption, variable_cost = allocated_usage(
+                    db,
+                    reading_metric,
+                    cost_start.isoformat(),
+                    cost_end.isoformat(),
+                    metric,
+                )
+                base_fee = prorated_months(
+                    cost_start.isoformat(), cost_end.isoformat()
+                ) * float(tariff["base_fee_monthly"])
+                total_cost = variable_cost + base_fee
+            else:
+                consumption = variable_cost = base_fee = total_cost = 0.0
+            effective_payment = actual_amount if actual_available else planned_amount
+            balance = effective_payment - total_cost
+
+            if planned["status"] == "suspended":
+                status, status_class = "Ausgesetzt", "warn"
+            elif review and not actual_available:
+                status, status_class = "Prüfung nötig", "warn"
+            elif actual_available:
+                if actual_amount < 0:
+                    status, status_class = "Rückbelastet", "warn"
+                elif math.isclose(actual_amount, planned_amount, abs_tol=0.01):
+                    status, status_class = "Bezahlt", "ok"
+                elif actual_amount < planned_amount:
+                    status, status_class = "Teilzahlung", "warn"
+                else:
+                    status, status_class = "Mehrzahlung", "ok"
+            elif due > today:
+                status, status_class = "Geplant", ""
+            elif due == today:
+                status, status_class = "Heute fällig", "warn"
+            else:
+                status, status_class = "Offen", "warn"
+
+            rows.append({
+                "tariff_id": tariff["id"],
+                "provider": tariff["provider"],
+                "tariff_from": tariff["valid_from"],
+                "tariff_to": tariff["valid_to"],
+                "due_on": planned["dueOn"],
+                "period_from": cost_start.isoformat(),
+                "period_to": cost_end.isoformat(),
+                "planned": planned_amount,
+                "actual": actual_amount,
+                "actual_available": actual_available,
+                "base_fee": base_fee,
+                "consumption": consumption,
+                "variable_cost": variable_cost,
+                "total_cost": total_cost,
+                "balance": balance,
+                "status": status,
+                "status_class": status_class,
+                "event_count": len(matched),
+                "kind": "scheduled",
+            })
+
+        # Keep one-off payments, corrections and unmatched bank entries visible.
+        for event in actual_events:
+            if event["id"] in assigned_event_ids or not event_is_counted(event):
+                continue
+            event_day = date.fromisoformat(event["due_on"] or event["booked_on"])
+            if filter_start and event_day < filter_start:
+                continue
+            if filter_end and event_day > filter_end:
+                continue
+            amount = float(event["amount"] or 0)
+            rows.append({
+                "tariff_id": tariff["id"],
+                "provider": tariff["provider"],
+                "tariff_from": tariff["valid_from"],
+                "tariff_to": tariff["valid_to"],
+                "due_on": event_day.isoformat(),
+                "booked_on": event["booked_on"],
+                "period_from": None,
+                "period_to": None,
+                "planned": None,
+                "actual": amount,
+                "actual_available": True,
+                "base_fee": None,
+                "consumption": None,
+                "variable_cost": None,
+                "total_cost": None,
+                "balance": amount,
+                "status": PAYMENT_EVENT_LABELS.get(event["event_type"], "Sonderbuchung"),
+                "status_class": "warn" if amount < 0 else "ok",
+                "event_count": 1,
+                "kind": "special",
+            })
+
+    return sorted(rows, key=lambda item: (item["due_on"], item["kind"], item["tariff_id"]))
+
+
+def energy_payment_plan_sections(db, metric: str, start_on=None, end_on=None, reference: date | None = None):
+    """Return one independent payment and cost summary per tariff revision.
+
+    Sections are deliberately keyed by tariff id, not provider name. A new tariff
+    from the same provider is therefore just as strict an accounting boundary as
+    an actual supplier change.
+    """
+    if metric not in ("grid_import", "gas", "water", "wastewater"):
+        return []
+    today = reference or date.today()
+    filter_start = date.fromisoformat(start_on) if start_on else None
+    filter_end = date.fromisoformat(end_on) if end_on else None
+    plan_rows = energy_payment_plan(db, metric, start_on, end_on, today)
+    rows_by_tariff = {}
+    for row in plan_rows:
+        rows_by_tariff.setdefault(row["tariff_id"], []).append(row)
+
+    sections = []
+    tariffs = db.execute(
+        "SELECT * FROM energy_tariffs WHERE metric=? ORDER BY valid_from,id", (metric,)
+    ).fetchall()
+    for tariff in tariffs:
+        tariff_start = date.fromisoformat(tariff["valid_from"])
+        tariff_end = date.fromisoformat(tariff["valid_to"]) if tariff["valid_to"] else None
+        section_start = max(value for value in (tariff_start, filter_start) if value is not None)
+        fallback_end = filter_end or tariff_end or date(today.year, 12, 31)
+        section_end = min(value for value in (tariff_end, fallback_end) if value is not None)
+        if section_end < section_start:
+            continue
+
+        section_rows = rows_by_tariff.get(tariff["id"], [])
+        calculated_to = min(section_end, today)
+        if calculated_to >= section_start:
+            consumption, variable_cost = allocated_usage(
+                db,
+                reading_metric_for(metric),
+                section_start.isoformat(),
+                calculated_to.isoformat(),
+                metric,
+            )
+            base_fee = prorated_months(
+                section_start.isoformat(), calculated_to.isoformat()
+            ) * float(tariff["base_fee_monthly"])
+        else:
+            consumption = variable_cost = base_fee = 0.0
+        balance_rows = [
+            row for row in section_rows
+            if date.fromisoformat(row["due_on"]) <= calculated_to
+        ] if calculated_to >= section_start else []
+        scheduled_balance_rows = [row for row in balance_rows if row["kind"] == "scheduled"]
+        special_balance_rows = [row for row in balance_rows if row["kind"] == "special"]
+        missing_due_dates = [
+            row["due_on"] for row in scheduled_balance_rows
+            if not row["actual_available"] and float(row["planned"] or 0) > 0
+        ]
+        actual_balance_rows = [row for row in balance_rows if row["actual_available"]]
+        effective_payments = sum(
+            float(row["actual"] or 0) if row["actual_available"] else float(row["planned"] or 0)
+            for row in scheduled_balance_rows
+        ) + sum(float(row["actual"] or 0) for row in special_balance_rows)
+        if not actual_balance_rows:
+            payment_basis = "planned"
+        elif missing_due_dates:
+            payment_basis = "actual_plus_planned"
+        else:
+            payment_basis = "actual"
+        total_cost = variable_cost + base_fee
+        balance = effective_payments - total_cost
+        latest = db.execute(
+            """SELECT read_on FROM energy_readings
+               WHERE metric=? AND is_valid=1 AND read_on>=? AND read_on<=?
+               ORDER BY read_on DESC,id DESC LIMIT 1""",
+            (
+                reading_metric_for(metric),
+                section_start.isoformat(),
+                calculated_to.isoformat(),
+            ),
+        ).fetchone() if calculated_to >= section_start else None
+        meter_complete = bool(latest and latest["read_on"] >= calculated_to.isoformat())
+        boundary_missing = missing_supplier_switch_readings(
+            db,
+            tariff,
+            tariff["valid_from"],
+            tariff["valid_to"] or section_end.isoformat(),
+        )
+        final = bool(
+            tariff_end
+            and tariff_end <= today
+            and section_start == tariff_start
+            and section_end == tariff_end
+            and meter_complete
+            and not missing_due_dates
+            and not boundary_missing
+        )
+        if math.isclose(balance, 0.0, abs_tol=0.005):
+            result_label = "Ausgeglichen" if final else "Vorläufig ausgeglichen"
+            result_class = "ok"
+        elif balance > 0:
+            result_label = "Erstattung" if final else "Voraussichtliche Erstattung"
+            result_class = "ok"
+        else:
+            result_label = "Nachzahlung" if final else "Voraussichtliche Nachzahlung"
+            result_class = "warn"
+
+        sections.append({
+            "tariff_id": tariff["id"],
+            "provider": tariff["provider"] or "Tarif ohne Anbieter",
+            "tariff_from": tariff["valid_from"],
+            "tariff_to": tariff["valid_to"],
+            "period_from": section_start.isoformat(),
+            "period_to": section_end.isoformat(),
+            "calculated_to": calculated_to.isoformat() if calculated_to >= section_start else None,
+            "payment_interval_months": int(tariff["payment_interval_months"] or 1),
+            "rows": section_rows,
+            "planned": sum(float(row["planned"] or 0) for row in section_rows if row["kind"] == "scheduled"),
+            "actual": sum(float(row["actual"] or 0) for row in section_rows if row["actual_available"]),
+            "actual_available": any(row["actual_available"] for row in section_rows),
+            "payment_basis": payment_basis,
+            "missing_due_dates": missing_due_dates,
+            "missing_boundary_readings": boundary_missing,
+            "effective_payments": effective_payments,
+            "base_fee": base_fee,
+            "consumption": consumption,
+            "variable_cost": variable_cost,
+            "total_cost": total_cost,
+            "balance": balance,
+            "result_label": result_label,
+            "result_class": result_class,
+            "final": final,
+        })
+    return sorted(
+        sections,
+        key=lambda section: tariff_display_sort_key(
+            section["tariff_from"],
+            section["tariff_to"],
+            section["tariff_id"],
+            today,
+        ),
+    )
+
+
+def settlement_values(variable=0.0, base_fee=0.0, advance=0.0, actual_advance=None):
     """Single source of truth for every settlement shown or exported."""
     variable = float(variable or 0.0)
     base_fee = float(base_fee or 0.0)
-    advance = float(advance or 0.0)
+    planned_advance = float(advance or 0.0)
+    actual_available = actual_advance is not None
+    actual_advance = float(actual_advance or 0.0) if actual_available else None
+    effective_advance = actual_advance if actual_available else planned_advance
     cost = variable + base_fee
     return {
         "variable": variable,
         "base_fee": base_fee,
         "cost": cost,
-        "advance": advance,
-        "balance": advance - cost,
+        # ``advance`` remains for API v2 consumers; it is now the best available
+        # settlement basis (confirmed actuals, otherwise the contractual plan).
+        "advance": effective_advance,
+        "planned_advance": planned_advance,
+        "actual_advance": actual_advance,
+        "actual_available": actual_available,
+        "payment_basis": "actual" if actual_available else "planned",
+        "balance": effective_advance - cost,
     }
 
 
@@ -660,7 +1464,11 @@ def energy_finances(db, start_on=None, end_on=None):
         _consumption, variable = allocated_usage(
             db, reading_metric_for(metric), start_on, end_on, metric
         )
-        result[metric] = settlement_values(variable=variable)
+        result[metric] = {
+            "variable": variable, "base_fee": 0.0, "planned_advance": 0.0,
+            "actual_advance": 0.0, "actual_available": False,
+            "effective_advance": 0.0, "payment_bases": [], "missing_due_dates": [],
+        }
     for tariff in db.execute("SELECT * FROM energy_tariffs ORDER BY valid_from,id"):
         metric = tariff["metric"]
         period_start = max(value for value in (tariff["valid_from"], start_on) if value)
@@ -668,12 +1476,33 @@ def energy_finances(db, start_on=None, end_on=None):
         period_end = min(candidates)
         if period_end < period_start:
             continue
-        months = calendar_months_touched(period_start, period_end)
-        result.setdefault(metric, settlement_values())
-        result[metric]["base_fee"] += months * tariff["base_fee_monthly"]
-        result[metric]["advance"] += advance_for_period(db, tariff, period_start, period_end)
+        result.setdefault(metric, {
+            "variable": 0.0, "base_fee": 0.0, "planned_advance": 0.0,
+            "actual_advance": 0.0, "actual_available": False,
+            "effective_advance": 0.0, "payment_bases": [], "missing_due_dates": [],
+        })
+        result[metric]["base_fee"] += prorated_months(period_start, period_end) * tariff["base_fee_monthly"]
+        payments = payment_basis_for_period(db, tariff, period_start, period_end)
+        result[metric]["planned_advance"] += payments["planned"]
+        result[metric]["actual_advance"] += payments["actual"]
+        result[metric]["effective_advance"] += payments["effective"]
+        result[metric]["payment_bases"].append(payments["basis"])
+        result[metric]["missing_due_dates"].extend(payments["missing_due_dates"])
+        result[metric]["actual_available"] = result[metric]["actual_available"] or payments["actual_available"]
     for metric, values in tuple(result.items()):
-        result[metric] = settlement_values(values["variable"], values["base_fee"], values["advance"])
+        settled = settlement_values(values["variable"], values["base_fee"], values["planned_advance"])
+        settled["actual_advance"] = values["actual_advance"] if values["actual_available"] else None
+        settled["actual_available"] = values["actual_available"]
+        settled["advance"] = values["effective_advance"]
+        settled["balance"] = settled["advance"] - settled["cost"]
+        bases = values["payment_bases"]
+        settled["payment_basis"] = (
+            "planned" if not values["actual_available"]
+            else "actual" if bases and all(basis == "actual" for basis in bases)
+            else "actual_plus_planned"
+        )
+        settled["missing_due_dates"] = sorted(set(values["missing_due_dates"]))
+        result[metric] = settled
     return result
 
 
@@ -682,31 +1511,39 @@ def energy_costs(db, start_on=None, end_on=None):
 
 
 def settlement_forecast(db, metric: str):
-    """Project the active contract from valid readings through its end date."""
+    """Project today's active contract and expose every accounting assumption."""
     if metric not in ("grid_import", "gas", "water", "wastewater"):
         return None
     reading_metric = reading_metric_for(metric)
-    latest = db.execute(
-        "SELECT read_on FROM energy_readings WHERE metric=? AND is_valid=1 ORDER BY read_on DESC LIMIT 1",
-        (reading_metric,),
-    ).fetchone()
-    if not latest:
-        return {"reason": "Noch kein gültiger Zählerstand vorhanden."}
-    latest_on = latest["read_on"]
+    today = date.today()
+    today_on = today.isoformat()
     tariff = db.execute(
         """SELECT * FROM energy_tariffs
            WHERE metric=? AND valid_from<=?
              AND (valid_to IS NULL OR valid_to>=?)
            ORDER BY valid_from DESC,id DESC LIMIT 1""",
-        (metric, latest_on, latest_on),
+        (metric, today_on, today_on),
     ).fetchone()
     if not tariff:
-        return {"reason": "Für den letzten Zählerstand ist kein Tarif hinterlegt."}
+        return {"reason": "Aktuell ist kein laufender Tarif hinterlegt."}
     if not tariff["valid_to"]:
         return {"reason": "Bitte beim aktuellen Tarif ein Enddatum hinterlegen."}
 
     contract_start = date.fromisoformat(tariff["valid_from"])
     contract_end = date.fromisoformat(tariff["valid_to"])
+    latest = db.execute(
+        """SELECT read_on FROM energy_readings
+           WHERE metric=? AND is_valid=1 AND read_on>=? AND read_on<=?
+           ORDER BY read_on DESC,id DESC LIMIT 1""",
+        (reading_metric, tariff["valid_from"], min(today, contract_end).isoformat()),
+    ).fetchone()
+    if not latest:
+        return {
+            "reason": "Für den aktuell laufenden Tarif ist noch kein gültiger Zählerstand vorhanden.",
+            "provider": tariff["provider"],
+            "contract_end": tariff["valid_to"],
+        }
+    latest_on = latest["read_on"]
     latest_day = date.fromisoformat(latest_on)
     consumption, current_variable = allocated_usage(
         db, reading_metric, tariff["valid_from"], latest_on, metric
@@ -719,34 +1556,96 @@ def settlement_forecast(db, metric: str):
         }
     first_reading = db.execute(
         """SELECT read_on FROM energy_readings
-           WHERE metric=? AND is_valid=1 AND read_on<=?
+           WHERE metric=? AND is_valid=1 AND read_on>=? AND read_on<=?
            ORDER BY read_on,id LIMIT 1""",
-        (reading_metric, latest_on),
+        (reading_metric, tariff["valid_from"], latest_on),
     ).fetchone()
-    observed_start = max(contract_start, date.fromisoformat(first_reading["read_on"]))
+    # On a supplier change, the old contract's exact closing reading (D) is
+    # also the baseline for the new contract beginning on D+1.  It deliberately
+    # sits one day outside the new tariff and must not be discarded when the
+    # observed daily average is calculated.
+    previous_day = contract_start - timedelta(days=1)
+    switch_baseline = db.execute(
+        """SELECT read_on FROM energy_readings
+           WHERE metric=? AND is_valid=1 AND read_on=?
+           ORDER BY id DESC LIMIT 1""",
+        (reading_metric, previous_day.isoformat()),
+    ).fetchone()
+    observed_start = (
+        previous_day
+        if switch_baseline
+        else max(contract_start, date.fromisoformat(first_reading["read_on"]))
+    )
     observed_days = max(1, (latest_day - observed_start).days)
     daily_average = consumption / observed_days
     remaining_days = max(0, (contract_end - latest_day).days)
     price_per_unit = float(tariff["price_per_kwh"]) * float(tariff["kwh_per_unit"])
 
-    current_base = calendar_months_touched(tariff["valid_from"], latest_on) * float(tariff["base_fee_monthly"])
-    current_advance = advance_for_period(db, tariff, tariff["valid_from"], latest_on)
+    current_base = prorated_months(tariff["valid_from"], latest_on) * float(tariff["base_fee_monthly"])
+    current_payments = payment_basis_for_period(db, tariff, tariff["valid_from"], latest_on)
 
     projected_consumption = consumption + daily_average * remaining_days
-    projected_variable = projected_consumption * price_per_unit
-    projected_base = calendar_months_touched(tariff["valid_from"], tariff["valid_to"]) * float(tariff["base_fee_monthly"])
-    projected_advance = advance_for_period(db, tariff, tariff["valid_from"], tariff["valid_to"])
-    current = settlement_values(current_variable, current_base, current_advance)
-    projected = settlement_values(projected_variable, projected_base, projected_advance)
+    projected_variable = current_variable + daily_average * remaining_days * price_per_unit
+    projected_base = prorated_months(tariff["valid_from"], tariff["valid_to"]) * float(tariff["base_fee_monthly"])
+    projected_planned = advance_for_period(db, tariff, tariff["valid_from"], tariff["valid_to"])
+
+    current = settlement_values(current_variable, current_base, current_payments["planned"])
+    current["actual_advance"] = current_payments["actual"] if current_payments["actual_available"] else None
+    current["actual_available"] = current_payments["actual_available"]
+    current["advance"] = current_payments["effective"]
+    current["balance"] = current["advance"] - current["cost"]
+    current["payment_basis"] = current_payments["basis"]
+    current["missing_due_dates"] = current_payments["missing_due_dates"]
+
+    # Bank payments are known through today, independently of how recent the
+    # latest meter reading is.  Confirmed values replace their matching dues;
+    # missing past and all future dues retain the contractual plan.
+    payment_cutoff = min(today, contract_end)
+    elapsed_payments = payment_basis_for_period(
+        db, tariff, tariff["valid_from"], payment_cutoff.isoformat()
+    )
+    future_start = payment_cutoff + timedelta(days=1)
+    future_planned = (
+        advance_for_period(db, tariff, future_start.isoformat(), tariff["valid_to"])
+        if future_start <= contract_end else 0.0
+    )
+    projected = settlement_values(projected_variable, projected_base, projected_planned)
+    projected["actual_advance"] = elapsed_payments["actual"] if elapsed_payments["actual_available"] else None
+    projected["actual_available"] = elapsed_payments["actual_available"]
+    projected["advance"] = elapsed_payments["effective"] + future_planned
+    projected["balance"] = projected["advance"] - projected["cost"]
+    projected["payment_basis"] = (
+        "planned" if not elapsed_payments["actual_available"]
+        else "actual" if not future_planned and elapsed_payments["basis"] == "actual"
+        else "actual_plus_planned"
+    )
+    projected["missing_due_dates"] = elapsed_payments["missing_due_dates"]
+    projected["future_planned"] = future_planned
     current["consumption"] = consumption
     projected["consumption"] = projected_consumption
+    data_age_days = max(0, (today - latest_day).days)
+    quality = "good"
+    quality_label = "Gute Datenbasis"
+    if observed_days < 30:
+        quality, quality_label = "limited", "Kurze Datenbasis"
+    if data_age_days > 7:
+        quality, quality_label = "stale", f"Zählerstand {data_age_days} Tage alt"
+    method = f"Lineare Hochrechnung aus {observed_days} Beobachtungstagen"
+    if metric == "gas":
+        method += "; saisonale Temperaturschwankungen sind nicht eingerechnet"
     return {
         "provider": tariff["provider"],
         "contract_start": tariff["valid_from"],
         "contract_end": tariff["valid_to"],
         "data_until": latest_on,
+        "baseline_on": observed_start.isoformat(),
+        "payment_until": payment_cutoff.isoformat(),
         "observed_days": observed_days,
         "daily_average": daily_average,
+        "data_age_days": data_age_days,
+        "quality": quality,
+        "quality_label": quality_label,
+        "method": method,
         "current": current,
         "projected": projected,
     }
@@ -780,6 +1679,10 @@ def personallab_payload():
             "baseFee": values.get("base_fee"),
             "cost": values.get("cost"),
             "advance": values.get("advance"),
+            "plannedAdvance": values.get("planned_advance"),
+            "actualAdvance": values.get("actual_advance"),
+            "actualAvailable": values.get("actual_available", False),
+            "paymentBasis": values.get("payment_basis", "planned"),
             "balance": values.get("balance"),
         }
 
@@ -804,6 +1707,27 @@ def personallab_payload():
             tariff_metric = "grid_import" if metric == "pv_self" else metric
             contracts = []
             for row in (item for item in tariffs if item["metric"] == tariff_metric):
+                schedule_end = row["valid_to"] or (today + timedelta(days=370)).isoformat()
+                planned_payments = scheduled_payment_events(db, row, row["valid_from"], schedule_end)
+                payment_events = []
+                for event in db.execute(
+                    """SELECT * FROM energy_payment_events WHERE tariff_id=?
+                       ORDER BY booked_on,id""",
+                    (row["id"],),
+                ):
+                    payment_events.append({
+                        "id": event["external_id"] or f"energylab:event:{event['id']}",
+                        "externalId": event["external_id"],
+                        "segmentId": event["segment_id"] or segment_id,
+                        "contractId": str(row["id"]),
+                        "plannedDate": event["due_on"],
+                        "bookingDate": event["booked_on"],
+                        "amountCents": int(round(float(event["amount"]) * 100)),
+                        "currency": "EUR", "status": event["status"],
+                        "eventType": event["event_type"],
+                        "confirmed": bool(event["confirmed"]),
+                        "source": event["source"],
+                    })
                 contracts.append({
                     "id": row["id"], "provider": row["provider"],
                     "validFrom": row["valid_from"], "validTo": row["valid_to"],
@@ -828,6 +1752,8 @@ def personallab_payload():
                         "SELECT valid_from,advance_monthly FROM energy_advance_changes WHERE tariff_id=? ORDER BY valid_from,id",
                         (row["id"],),
                     )],
+                    "plannedPayments": planned_payments,
+                    "paymentEvents": payment_events,
                     "active": row["valid_from"] <= today_text and (
                         not row["valid_to"] or row["valid_to"] >= today_text
                     ),
@@ -863,11 +1789,12 @@ def personallab_payload():
                 "contracts": contracts, "history": history,
                 "invalidCount": int(invalid or 0),
             })
+        sync_status = finanzlab_sync_status(db)
     return {
-        "version": "2", "source": {"app": APP_NAME, "version": APP_VERSION},
+        "version": "3", "source": {"app": APP_NAME, "version": APP_VERSION},
         "generatedAt": datetime.now(timezone.utc).isoformat(),
         "period": {"monthStart": month_start, "yearStart": year_start},
-        "segments": segments,
+        "segments": segments, "integrationStatus": {"financeLab": sync_status},
     }
 
 
@@ -972,6 +1899,46 @@ def parse_energy_tariff(form):
         "first_payment_date": first_payment_date,
         "payment_account": payment_account,
     }
+
+
+def validate_tariff_timeline_neighbors(
+    db, metric: str, valid_from: str, valid_to: str | None, exclude_id=None
+) -> None:
+    """Reject silent holes between neighbouring contracts for one meter stream."""
+    exclusion = " AND id<>?" if exclude_id is not None else ""
+    previous_args = [metric, valid_from]
+    next_args = [metric, valid_from]
+    if exclude_id is not None:
+        previous_args.append(exclude_id)
+        next_args.append(exclude_id)
+    previous = db.execute(
+        f"""SELECT id,valid_from,valid_to FROM energy_tariffs
+            WHERE metric=? AND valid_from<?{exclusion}
+            ORDER BY valid_from DESC,id DESC LIMIT 1""",
+        previous_args,
+    ).fetchone()
+    following = db.execute(
+        f"""SELECT id,valid_from,valid_to FROM energy_tariffs
+            WHERE metric=? AND valid_from>?{exclusion}
+            ORDER BY valid_from,id LIMIT 1""",
+        next_args,
+    ).fetchone()
+
+    start_day = date.fromisoformat(valid_from)
+    if previous and previous["valid_to"]:
+        expected_start = date.fromisoformat(previous["valid_to"]) + timedelta(days=1)
+        if start_day != expected_start:
+            raise ValueError(
+                "Zwischen den Verträgen würde eine unbeabsichtigte Lücke entstehen. "
+                f"Der neue Zeitraum muss lückenlos am {expected_start.strftime('%d.%m.%Y')} beginnen."
+            )
+    if following:
+        expected_end = date.fromisoformat(following["valid_from"]) - timedelta(days=1)
+        if not valid_to or date.fromisoformat(valid_to) != expected_end:
+            raise ValueError(
+                "Zwischen den Verträgen würde eine unbeabsichtigte Lücke entstehen. "
+                f"Der Zeitraum muss lückenlos am {expected_end.strftime('%d.%m.%Y')} enden."
+            )
 
 
 def vehicle_fluids(db, vehicle_id: int):
@@ -1400,9 +2367,408 @@ def sync_home_assistant():
     return messages
 
 
+def finanzlab_config(db=None):
+    owns_connection = db is None
+    db = db or connect()
+    try:
+        return {
+            "financeLabBaseUrl": get_meta("finanzlab_base_url", FINANZLAB_URL, db).strip().rstrip("/"),
+            "householdId": get_meta("finanzlab_household_id", FINANZLAB_HOUSEHOLD_ID, db).strip(),
+            "accessToken": get_meta("finanzlab_access_token", FINANZLAB_TOKEN, db).strip(),
+        }
+    finally:
+        if owns_connection:
+            db.close()
+
+
+def finanzlab_ready(db=None) -> bool:
+    config = finanzlab_config(db)
+    return bool(config["financeLabBaseUrl"] and config["householdId"])
+
+
+def finanzlab_sync_status(db=None):
+    owns_connection = db is None
+    db = db or connect()
+    try:
+        config = finanzlab_config(db)
+        row = db.execute(
+            """SELECT * FROM integration_sync_log WHERE integration='finanzlab'
+               ORDER BY synced_at DESC,id DESC LIMIT 1"""
+        ).fetchone()
+        unresolved = db.execute(
+            """SELECT COUNT(*) count FROM energy_payment_events
+               WHERE tariff_id IS NULL OR confirmed=0 OR status IN ('pending','review')"""
+        ).fetchone()["count"]
+        return {
+            "configured": bool(config["financeLabBaseUrl"] and config["householdId"]),
+            "baseUrl": config["financeLabBaseUrl"],
+            "householdId": config["householdId"],
+            "lastSyncAt": row["synced_at"] if row else None,
+            "status": row["status"] if row else "never",
+            "message": row["message"] if row else "Noch kein Zahlungsabgleich durchgeführt.",
+            "importedCount": int(row["imported_count"] or 0) if row else 0,
+            "unresolvedCount": int(unresolved or 0),
+        }
+    finally:
+        if owns_connection:
+            db.close()
+
+
+def _bool_value(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "true", "yes", "ja", "confirmed")
+
+
+def _payment_event_type(value: str) -> str:
+    raw = str(value or "regular_payment").strip().lower().replace("-", "_")
+    aliases = {
+        "payment": "regular_payment", "paid": "regular_payment", "installment": "regular_payment",
+        "advance": "regular_payment", "one_off": "one_off_payment", "extra_payment": "one_off_payment",
+        "suspended": "suspension", "pause": "suspension", "reversal": "chargeback",
+        "reversed": "chargeback", "refund": "credit_payout", "credit": "credit_payout",
+        "adjustment": "correction",
+    }
+    normalized = aliases.get(raw, raw)
+    return normalized if normalized in PAYMENT_EVENT_LABELS else "regular_payment"
+
+
+def _signed_payment_amount(event_type: str, amount) -> float:
+    value = float(amount or 0.0)
+    if event_type in ("regular_payment", "one_off_payment"):
+        return abs(value)
+    if event_type in ("chargeback", "credit_payout"):
+        return -abs(value)
+    if event_type == "suspension":
+        return 0.0
+    return value
+
+
+def sync_finanzlab():
+    """Pull confirmed payment matches from FinanzLab 1.3, idempotently."""
+    config = finanzlab_config()
+    if not config["financeLabBaseUrl"] or not config["householdId"]:
+        raise RuntimeError("FinanzLab-URL oder Haushalts-ID ist noch nicht eingerichtet.")
+    with connect() as db:
+        earliest = db.execute("SELECT MIN(valid_from) first_on FROM energy_tariffs").fetchone()["first_on"]
+    params = {"household_id": config["householdId"]}
+    if earliest:
+        params["since"] = earliest
+    url = config["financeLabBaseUrl"] + "/api/integrations/energylab/actual-payments?" + urllib.parse.urlencode(params)
+    headers = {"Accept": "application/json", "User-Agent": f"EnergieLab/{APP_VERSION}"}
+    if config["accessToken"]:
+        headers["Authorization"] = f"Bearer {config['accessToken']}"
+    try:
+        request = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=15) as response:
+                if response.status != 200:
+                    raise RuntimeError(f"FinanzLab antwortet mit Status {response.status}.")
+                raw = response.read(MAX_UPLOAD + 1)
+        except urllib.error.HTTPError as exc:
+            response_text = ""
+            try:
+                response_text = exc.read(MAX_UPLOAD).decode("utf-8", errors="replace").strip()
+                response_payload = json.loads(response_text)
+                response_text = str(response_payload.get("error") or response_text).strip()
+            except (ValueError, TypeError):
+                pass
+            if response_text == "EnergyLab-Verbindung nicht gefunden.":
+                response_text += (
+                    " Bitte in FinanzLab unter Einstellungen zuerst die EnergyLab-Verbindung "
+                    "für genau diesen Haushalt speichern."
+                )
+            detail = f": {response_text}" if response_text else ""
+            raise RuntimeError(f"FinanzLab lehnt den Zahlungsabgleich ab (HTTP {exc.code}){detail}") from exc
+        except urllib.error.URLError as exc:
+            reason = getattr(exc, "reason", exc)
+            raise RuntimeError(
+                f"FinanzLab ist unter {config['financeLabBaseUrl']} nicht erreichbar: {reason}"
+            ) from exc
+        if len(raw) > MAX_UPLOAD:
+            raise RuntimeError("Die Zahlungsantwort von FinanzLab ist unerwartet groß.")
+        payload = json.loads(raw.decode("utf-8"))
+        payments = payload.get("payments") or []
+        if not isinstance(payments, list):
+            raise ValueError("FinanzLab hat keine gültige Zahlungsliste geliefert.")
+        imported = unresolved = ignored = 0
+        with connect() as db:
+            for item in payments:
+                if not isinstance(item, dict) or not str(item.get("id") or "").strip():
+                    ignored += 1
+                    continue
+                external_id = str(item["id"]).strip()[:240]
+                contract_id = str(item.get("contractId") or item.get("contract_id") or "").strip()
+                tariff = None
+                if contract_id.isdigit():
+                    tariff = db.execute("SELECT id,metric FROM energy_tariffs WHERE id=?", (int(contract_id),)).fetchone()
+                segment_id = str(item.get("segmentId") or item.get("segment_id") or "").strip()
+                if tariff and segment_id and SEGMENT_BY_METRIC.get(tariff["metric"]) != segment_id:
+                    tariff = None
+                due_value = (item.get("plannedDate") or item.get("planned_date") or
+                             item.get("occurrenceDate") or item.get("occurrence_date"))
+                booked_value = (item.get("bookingDate") or item.get("booking_date") or
+                                item.get("occurrenceDate") or item.get("occurrence_date") or due_value)
+                if not booked_value:
+                    ignored += 1
+                    continue
+                try:
+                    booked_on = parse_iso_date(booked_value)
+                    due_on = parse_iso_date(due_value or booked_value)
+                except (TypeError, ValueError):
+                    ignored += 1
+                    continue
+                event_type = _payment_event_type(item.get("eventType") or item.get("event_type"))
+                raw_cents = item.get("actualAmountCents")
+                if raw_cents is None:
+                    raw_cents = item.get("actual_amount_cents")
+                if raw_cents is None:
+                    raw_cents = item.get("amountCents", item.get("amount_cents",
+                        item.get("plannedAmountCents", item.get("planned_amount_cents", 0))))
+                try:
+                    amount = _signed_payment_amount(event_type, float(raw_cents) / 100.0)
+                except (TypeError, ValueError):
+                    ignored += 1
+                    continue
+                status = str(item.get("status") or "paid").strip().lower()[:24]
+                confirmed = _bool_value(item.get("confirmed"), default=True)
+                try:
+                    confidence = float(item["confidence"]) if item.get("confidence") is not None else None
+                except (TypeError, ValueError):
+                    confidence = None
+                db.execute(
+                    """INSERT INTO energy_payment_events(
+                           external_id,tariff_id,segment_id,due_on,booked_on,amount,event_type,status,
+                           source,match_method,confidence,confirmed,note,raw_payload)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(external_id) WHERE external_id IS NOT NULL DO UPDATE SET
+                           tariff_id=excluded.tariff_id,segment_id=excluded.segment_id,
+                           due_on=excluded.due_on,booked_on=excluded.booked_on,amount=excluded.amount,
+                           event_type=excluded.event_type,status=excluded.status,
+                           match_method=excluded.match_method,confidence=excluded.confidence,
+                           confirmed=excluded.confirmed,note=excluded.note,
+                           raw_payload=excluded.raw_payload,updated_at=CURRENT_TIMESTAMP""",
+                    (
+                        external_id, tariff["id"] if tariff else None, segment_id, due_on, booked_on,
+                        amount, event_type, status, "finanzlab", str(item.get("matchMethod") or item.get("match_method") or "")[:80],
+                        confidence, 1 if confirmed else 0, "Von FinanzLab abgeglichen",
+                        json.dumps(item, ensure_ascii=False, sort_keys=True),
+                    ),
+                )
+                imported += 1
+                if not tariff or not confirmed or status in ("pending", "review"):
+                    unresolved += 1
+            set_meta("actual_payments_enabled", "1", db)
+            message = f"{imported} Zahlungsereignisse abgeglichen"
+            if unresolved:
+                message += f", {unresolved} noch zu prüfen"
+            if ignored:
+                message += f", {ignored} ungültige Einträge übersprungen"
+            db.execute(
+                """INSERT INTO integration_sync_log(
+                       integration,direction,status,message,imported_count,unresolved_count,details_json)
+                   VALUES('finanzlab','pull',?,?,?,?,?)""",
+                (
+                    "warning" if unresolved or ignored else "ok", message, imported, unresolved,
+                    json.dumps({"source": payload.get("source"), "ignored": ignored}, ensure_ascii=False),
+                ),
+            )
+        return imported, [message]
+    except Exception as exc:
+        with connect() as db:
+            db.execute(
+                """INSERT INTO integration_sync_log(integration,direction,status,message)
+                   VALUES('finanzlab','pull','error',?)""",
+                (str(exc)[:500],),
+            )
+        raise
+
+
+def sync_all_sources():
+    messages = []
+    failures = []
+    if ha_ready():
+        try:
+            messages.extend(sync_home_assistant())
+        except Exception as exc:
+            failures.append(f"Home Assistant: {exc}")
+    if finanzlab_ready():
+        try:
+            _count, finance_messages = sync_finanzlab()
+            messages.extend(finance_messages)
+        except Exception as exc:
+            failures.append(f"FinanzLab: {exc}")
+    if not ha_ready() and not finanzlab_ready():
+        raise RuntimeError("Weder Home Assistant noch FinanzLab ist eingerichtet.")
+    messages.extend(failures)
+    return messages
+
+
+def missing_supplier_switch_readings(db, tariff, start_on: str, end_on: str):
+    """Return exact meter boundaries missing between adjacent tariff records."""
+    reading_metric = reading_metric_for(tariff["metric"])
+    tariff_start = date.fromisoformat(tariff["valid_from"])
+    tariff_end = date.fromisoformat(tariff["valid_to"]) if tariff["valid_to"] else None
+
+    required = []
+    previous_day = tariff_start - timedelta(days=1)
+    previous_tariff = db.execute(
+        """SELECT id FROM energy_tariffs
+           WHERE id<>? AND metric=? AND valid_to=? LIMIT 1""",
+        (tariff["id"], tariff["metric"], previous_day.isoformat()),
+    ).fetchone()
+    if previous_tariff and start_on == tariff["valid_from"]:
+        required.append(previous_day.isoformat())
+
+    if tariff_end and end_on == tariff["valid_to"]:
+        next_day = tariff_end + timedelta(days=1)
+        next_tariff = db.execute(
+            """SELECT id FROM energy_tariffs
+               WHERE id<>? AND metric=? AND valid_from=? LIMIT 1""",
+            (tariff["id"], tariff["metric"], next_day.isoformat()),
+        ).fetchone()
+        if next_tariff:
+            required.append(tariff_end.isoformat())
+
+    missing = []
+    for boundary_on in sorted(set(required)):
+        reading = db.execute(
+            """SELECT 1 FROM energy_readings
+               WHERE metric=? AND read_on=? AND is_valid=1 LIMIT 1""",
+            (reading_metric, boundary_on),
+        ).fetchone()
+        if not reading:
+            missing.append(boundary_on)
+    return missing
+
+
+def require_supplier_switch_readings(db, tariff, start_on: str, end_on: str) -> None:
+    """Require an exact shared meter boundary before freezing adjacent tariffs."""
+    missing = missing_supplier_switch_readings(db, tariff, start_on, end_on)
+    if missing:
+        formatted = ", ".join(
+            date.fromisoformat(value).strftime("%d.%m.%Y") for value in missing
+        )
+        raise ValueError(
+            "Für die Schlussrechnung am Lieferantenwechsel fehlt ein exakter "
+            f"gültiger Zählerstand ({formatted}). Bitte den Wechselstand zuerst erfassen."
+        )
+
+
+def settlement_snapshot_payload(db, tariff_id: int, start_on: str, end_on: str):
+    """Build the exact, self-contained data recorded by a final settlement."""
+    start_on = parse_iso_date(start_on)
+    end_on = parse_iso_date(end_on)
+    tariff = db.execute("SELECT * FROM energy_tariffs WHERE id=?", (tariff_id,)).fetchone()
+    if not tariff or not start_on or not end_on or end_on < start_on:
+        raise ValueError("Tarif oder Abrechnungszeitraum ist ungültig.")
+    if start_on < tariff["valid_from"] or (tariff["valid_to"] and end_on > tariff["valid_to"]):
+        raise ValueError("Der Abrechnungszeitraum muss vollständig innerhalb des Vertrags liegen.")
+    require_supplier_switch_readings(db, tariff, start_on, end_on)
+    reading_metric = reading_metric_for(tariff["metric"])
+    consumption, variable = allocated_usage(db, reading_metric, start_on, end_on, tariff["metric"])
+    base_fee = prorated_months(start_on, end_on) * float(tariff["base_fee_monthly"])
+    planned_events = scheduled_payment_events(
+        db,
+        tariff,
+        start_on,
+        end_on,
+    )
+    planned = sum(
+        float(event["amount"])
+        for event in planned_events
+    )
+
+    # Für die Schlussabrechnung gilt der hinterlegte Zahlungsplan.
+    # Eine zusätzliche Bestätigung über FinanzLab ist nicht nötig.
+    values = settlement_values(
+        variable,
+        base_fee,
+        planned,
+    )
+
+    changes = [dict(row) for row in db.execute(
+        """SELECT valid_from,advance_monthly,created_at FROM energy_advance_changes
+           WHERE tariff_id=? AND valid_from<=? ORDER BY valid_from,id""",
+        (tariff_id, end_on),
+    )]
+    return {
+        "schemaVersion": "2", "source": {"app": APP_NAME, "version": APP_VERSION},
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "contract": {
+            "id": str(tariff["id"]), "segmentId": SEGMENT_BY_METRIC.get(tariff["metric"], tariff["metric"]),
+            "metric": tariff["metric"], "provider": tariff["provider"],
+            "validFrom": tariff["valid_from"], "validTo": tariff["valid_to"],
+            "unitPrice": tariff["price_per_kwh"], "kwhPerUnit": tariff["kwh_per_unit"],
+            "baseFeeMonthly": tariff["base_fee_monthly"],
+            "originalPaymentAmount": tariff["advance_monthly"],
+            "paymentDay": tariff["payment_day"],
+            "paymentIntervalMonths": tariff["payment_interval_months"],
+            "firstPaymentDate": tariff["first_payment_date"],
+            "paymentAccountName": tariff["payment_account"],
+            "advanceChanges": changes,
+        },
+        "period": {"from": start_on, "to": end_on},
+        "consumption": {"amount": consumption, "unit": METRICS[reading_metric]["unit"]},
+        "plannedPayments": planned_events,
+        "actualPayments": [],
+        "settlement": {
+            "variableCost": values["variable"], "baseFee": values["base_fee"],
+            "totalCost": values["cost"], "plannedPayments": values["planned_advance"],
+            "actualPayments": None, "paymentBasis": "planned",
+            "balance": values["balance"],
+        },
+    }
+
+
+def create_settlement_snapshot(tariff_id: int, start_on: str, end_on: str, title=""):
+    with connect() as db:
+        payload = settlement_snapshot_payload(db, tariff_id, start_on, end_on)
+        revision = db.execute(
+            """SELECT COALESCE(MAX(revision),0)+1 revision FROM energy_settlement_snapshots
+               WHERE tariff_id=? AND period_from=? AND period_to=?""",
+            (tariff_id, payload["period"]["from"], payload["period"]["to"]),
+        ).fetchone()["revision"]
+        payload["revision"] = revision
+        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        cur = db.execute(
+            """INSERT INTO energy_settlement_snapshots(
+                   tariff_id,revision,period_from,period_to,title,payment_basis,payload_json,payload_sha256)
+               VALUES(?,?,?,?,?,'planned',?,?)""",
+            (tariff_id, revision, payload["period"]["from"], payload["period"]["to"], str(title).strip()[:160], raw, digest),
+        )
+        return cur.lastrowid, revision, digest
+
+
+def settlement_snapshots_payload(snapshot_id=None):
+    with connect() as db:
+        if snapshot_id is None:
+            rows = db.execute(
+                """SELECT s.id,s.tariff_id,s.revision,s.period_from,s.period_to,s.title,
+                          s.payment_basis,s.payload_sha256,s.created_at,t.metric,t.provider
+                   FROM energy_settlement_snapshots s JOIN energy_tariffs t ON t.id=s.tariff_id
+                   ORDER BY s.created_at DESC,s.id DESC"""
+            ).fetchall()
+            return {"source": {"app": APP_NAME, "version": APP_VERSION}, "snapshots": [dict(row) for row in rows]}
+        row = db.execute("SELECT * FROM energy_settlement_snapshots WHERE id=?", (snapshot_id,)).fetchone()
+        if not row:
+            return None
+        payload = json.loads(row["payload_json"])
+        payload["snapshot"] = {
+            "id": row["id"], "revision": row["revision"], "title": row["title"],
+            "createdAt": row["created_at"], "sha256": row["payload_sha256"],
+            "immutable": True,
+        }
+        return payload
+
+
 def sync_due(now: datetime, last_attempt: str | None) -> bool:
     today = now.date().isoformat()
-    return last_attempt != today and (now.hour, now.minute) >= (SYNC_HOUR, SYNC_MINUTE)
+    hour, minute = sync_time()
+    return last_attempt != today and (now.hour, now.minute) >= (hour, minute)
 
 
 def sync_scheduler():
@@ -1410,9 +2776,9 @@ def sync_scheduler():
     while True:
         now = datetime.now()
         today = now.date().isoformat()
-        if ha_ready() and sync_due(now, last_attempt):
+        if (ha_ready() or finanzlab_ready()) and sync_due(now, last_attempt):
             try:
-                sync_home_assistant()
+                sync_all_sources()
             except Exception as exc:
                 with connect() as db:
                     db.execute("INSERT INTO sync_log(status,message) VALUES('error',?)", (str(exc),))
@@ -1427,6 +2793,7 @@ STYLE = r"""
 
 STYLE += r"""
 .grid{grid-template-columns:repeat(auto-fit,minmax(220px,1fr))}
+.settings-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
 details.tariff-history{background:linear-gradient(155deg,rgba(31,38,48,.96),rgba(22,27,34,.96));border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow)}
 details.tariff-history summary{cursor:pointer;list-style:none;padding:20px;font-size:19px;font-weight:750;display:flex;justify-content:space-between;gap:12px;align-items:center}
 details.tariff-history summary::-webkit-details-marker{display:none}
@@ -1444,7 +2811,22 @@ button:disabled{opacity:.45;cursor:not-allowed;filter:none}
 .summary-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px}.summary-box{background:#111820;border:1px solid var(--line);border-radius:13px;padding:14px}.summary-box .value{font-size:22px;font-weight:800;margin-top:5px}.summary-box .value.ok{color:var(--green)}.summary-box .value.warn{color:#ffb0b0}.reading-invalid td{background:rgba(255,107,107,.06);color:#ffc8cc}
 .month-nav{display:grid;grid-template-columns:46px minmax(180px,280px) 46px;align-items:center;justify-content:center;gap:12px;margin:-8px 0 22px}.month-nav .month-title{text-align:center}.month-nav .month-title strong{display:block;font-size:19px}.month-arrow{width:46px;height:42px;border-radius:11px;display:grid;place-items:center;background:var(--panel2);border:1px solid var(--line);color:var(--text);font-size:25px;line-height:1}.month-arrow:hover{border-color:var(--blue);text-decoration:none}.month-arrow.disabled{opacity:.35;cursor:not-allowed}.current-month-link{grid-column:1/-1;justify-self:center;margin-top:2px}.current-month-link.disabled{opacity:.45;cursor:not-allowed}
 .comparison-delta{font-weight:800}.comparison-delta.more{color:var(--orange)}.comparison-delta.less{color:var(--green)}.comparison-delta.same{color:var(--muted)}.comparison-percent{display:block;font-size:12px;font-weight:600;margin-top:2px}
-@media(max-width:1000px){.settlement-grid{grid-template-columns:1fr}}
+.main{min-width:0;overflow-x:hidden}.card,.section,.topbar>*,.detail-view{min-width:0}.table-wrap{max-width:100%}
+.detail-primary-tabs{display:flex;gap:7px;max-width:100%;overflow-x:auto;padding:5px;margin-bottom:20px;scrollbar-width:thin}
+.detail-primary-tabs a{display:flex;align-items:center;gap:7px;flex:1 0 max-content;justify-content:center;min-height:42px;padding:9px 14px}
+.detail-primary-tabs a.active{box-shadow:0 5px 18px rgba(61,169,252,.18)}
+.detail-toolbar{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;margin-bottom:18px}.detail-toolbar .tabs{max-width:100%;overflow-x:auto}
+.detail-intro{margin:0 0 16px}.detail-intro h2{margin:0 0 4px;font-size:20px}.detail-intro p{margin:0}
+.plan-payment{display:grid;gap:2px}.plan-payment strong{font-size:15px}.plan-payment .muted{font-size:12px}
+.payment-plan-table th,.payment-plan-table td{vertical-align:top}.payment-plan-table td:nth-child(1),.payment-plan-table td:nth-child(2){white-space:normal;min-width:132px}
+.payment-plan-table td:nth-child(3){min-width:105px}.payment-plan-table td:last-child{white-space:normal;min-width:120px}
+.source-detail{display:grid;gap:2px;white-space:normal;min-width:155px}.source-detail .muted{font-size:12px;overflow-wrap:anywhere}
+.compact-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.forecast-note{margin:14px 0 0}.forecast-note strong{display:block;margin-bottom:3px}.summary-box .meta{font-size:12px;color:var(--muted);margin-top:7px}
+.supplier-payment-section{padding:0;overflow:hidden}.supplier-header{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;padding:20px;border-bottom:1px solid var(--line)}.supplier-header h2{margin:2px 0 3px;font-size:22px}.supplier-kicker{color:var(--cyan);font-size:11px;font-weight:800;letter-spacing:.09em;text-transform:uppercase}.supplier-badges{display:flex;gap:7px;flex-wrap:wrap;justify-content:flex-end}.supplier-summary{padding:18px 20px}.supplier-result{border-color:#3a6176;background:linear-gradient(145deg,#132530,#111820)}.supplier-note{margin:0 20px 18px}.supplier-table{border-top:1px solid var(--line)}.supplier-table table{min-width:1040px}.supplier-table th:first-child,.supplier-table td:first-child{padding-left:20px}.supplier-table th:last-child,.supplier-table td:last-child{padding-right:20px}
+@media(max-width:1000px){.settlement-grid,.settings-grid{grid-template-columns:1fr}}
+@media(max-width:760px){.detail-primary-tabs{margin-inline:-4px}.detail-primary-tabs a{flex:0 0 auto}.detail-toolbar{align-items:flex-start}.summary-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.summary-box{padding:12px}.summary-box .value{font-size:18px}.supplier-header{padding:16px;flex-direction:column}.supplier-badges{justify-content:flex-start}.supplier-summary{padding:14px 16px}.supplier-note{margin-inline:16px}}
+@media(max-width:430px){.summary-grid{grid-template-columns:1fr}.detail-primary-tabs a{padding-inline:11px}}
 """
 
 
@@ -1460,12 +2842,12 @@ def page(title, body, active="", notice="", warning=False):
         ("/vehicles", "Fahrzeuge", "🚐"),
         ("/fuelings", "Tankungen", "⛽"),
         ("/vehicle-costs", "Fahrzeugkosten", "€"),
-        ("/import", "Import", "⇩"),
+        ("/contract-history", "Vertragshistorie", "🗂"),
         ("/support", "Unterstützung", "♥"),
     ]
     nav = "".join(f'<a class="{"active" if active == href else ""}" href="{href}"><span>{icon}</span> {label}</a>' for href, label, icon in items)
     notice_html = f'<div class="notice {"warn" if warning else ""}">{esc(notice)}</div>' if notice else ""
-    return f"""<!doctype html><html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark"><title>{esc(title)} · {APP_NAME}</title><style>{STYLE}</style></head><body><div class="layout"><aside class="sidebar"><div class="brand"><span class="logo">EL</span><span>{APP_NAME}</span></div><nav>{nav}</nav><div class="side-bottom">Lokal auf deinem Homelab</div></aside><main class="main">{notice_html}{body}<footer class="footer">by Lrd.Tiberius · EnergieLab {APP_VERSION}</footer></main></div></body></html>"""
+    return f"""<!doctype html><html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark"><meta name="theme-color" content="#111827"><link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png"><link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png"><link rel="manifest" href="/site.webmanifest"><title>{esc(title)} · {APP_NAME}</title><style>{STYLE}</style></head><body><div class="layout"><aside class="sidebar"><div class="brand"><span class="logo">EL</span><span>{APP_NAME}</span></div><nav>{nav}</nav><div class="side-bottom">Lokal auf deinem Homelab</div></aside><main class="main">{notice_html}{body}<footer class="footer">by Lrd.Tiberius · EnergieLab {APP_VERSION}</footer></main></div></body></html>"""
 
 
 def sparkline(db, metric, days=30):
@@ -1616,7 +2998,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "same-origin")
         self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'")
-        self.send_header("Cache-Control", "no-store")
+        if not headers or "Cache-Control" not in headers:
+            self.send_header("Cache-Control", "no-store")
         if headers:
             for key, value in headers.items():
                 self.send_header(key, value)
@@ -1666,12 +3049,161 @@ class Handler(BaseHTTPRequestHandler):
         url = urllib.parse.urlparse(self.path)
         path = url.path.rstrip("/") or "/"
         query = urllib.parse.parse_qs(url.query)
+        static_assets = {
+            "/apple-touch-icon.png": ("apple-touch-icon.png", "image/png"),
+            "/favicon-32x32.png": ("favicon-32x32.png", "image/png"),
+            "/icon-192.png": ("icon-192.png", "image/png"),
+            "/icon-512.png": ("icon-512.png", "image/png"),
+            "/site.webmanifest": ("site.webmanifest", "application/manifest+json; charset=utf-8"),
+        }
+        if path in static_assets:
+            filename, content_type = static_assets[path]
+            self.send_bytes(
+                (ASSET_DIR / filename).read_bytes(),
+                content_type,
+                headers={"Cache-Control": "public, max-age=86400"},
+            )
+            return
+        if path == "/contract-history":
+            self.contract_history_page()
+            return
+
         if path == "/api/health":
             self.send_bytes(json.dumps({"status": "ok", "version": APP_VERSION}).encode(), "application/json")
             return
         if path == "/api/personallab":
             payload = json.dumps(personallab_payload(), ensure_ascii=False).encode("utf-8")
             self.send_bytes(payload, "application/json; charset=utf-8")
+            return
+        if path == "/api/integrations/finanzlab/status":
+            self.send_bytes(json.dumps(finanzlab_sync_status(), ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+            return
+        request_path = urllib.parse.urlparse(
+            self.path
+        ).path
+
+        if (
+            request_path.startswith(
+                "/api/energy/tariffs/"
+            )
+            and request_path.endswith(
+                "/planned-payments"
+            )
+        ):
+            try:
+                tariff_id = int(
+                    request_path.split("/")[4]
+                )
+
+                query = urllib.parse.parse_qs(
+                    urllib.parse.urlparse(
+                        self.path
+                    ).query
+                )
+
+                start_on = parse_iso_date(
+                    str(
+                        query.get(
+                            "from",
+                            [""],
+                        )[0]
+                    )
+                )
+
+                end_on = parse_iso_date(
+                    str(
+                        query.get(
+                            "to",
+                            [""],
+                        )[0]
+                    )
+                )
+
+                with connect() as db:
+                    tariff = db.execute(
+                        """
+                        SELECT *
+                        FROM energy_tariffs
+                        WHERE id=?
+                        """,
+                        (tariff_id,),
+                    ).fetchone()
+
+                    if (
+                        not tariff
+                        or not start_on
+                        or not end_on
+                        or end_on < start_on
+                    ):
+                        raise ValueError(
+                            "Ungültiger Abrechnungszeitraum."
+                        )
+
+                    if (
+                        start_on
+                        < tariff["valid_from"]
+                    ):
+                        raise ValueError(
+                            "Zeitraum beginnt vor dem Vertrag."
+                        )
+
+                    if (
+                        tariff["valid_to"]
+                        and end_on
+                        > tariff["valid_to"]
+                    ):
+                        raise ValueError(
+                            "Zeitraum endet nach dem Vertrag."
+                        )
+
+                    events = scheduled_payment_events(
+                        db,
+                        tariff,
+                        start_on,
+                        end_on,
+                    )
+
+                    result = {
+                        "amount": round(
+                            sum(
+                                float(
+                                    event["amount"]
+                                )
+                                for event in events
+                            ),
+                            2,
+                        ),
+                        "count": len(events),
+                    }
+
+            except Exception as exc:
+                result = {
+                    "amount": 0.0,
+                    "count": 0,
+                    "error": str(exc),
+                }
+
+            self.send_bytes(
+                json.dumps(
+                    result,
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+                "application/json; charset=utf-8",
+            )
+            return
+
+        if path == "/api/settlements":
+            self.send_bytes(json.dumps(settlement_snapshots_payload(), ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+            return
+        if path.startswith("/api/settlements/"):
+            try:
+                payload = settlement_snapshots_payload(int(path.split("/")[3]))
+            except (ValueError, IndexError):
+                payload = None
+            if payload is None:
+                self.send_bytes(b'{"error":"not_found"}', "application/json; charset=utf-8", 404)
+            else:
+                self.send_bytes(json.dumps(payload, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
             return
         if path in ("/login", "/logout"):
             self.redirect("/")
@@ -1685,12 +3217,20 @@ class Handler(BaseHTTPRequestHandler):
             self.compare_page(query)
         elif path == "/settings":
             self.settings_page(notice)
+        elif path.startswith("/settlements/"):
+            self.settlement_snapshot_page(int(path.split("/")[2]))
+        elif path.startswith("/settings/backups/") and path.endswith("/download"):
+            self.download_database_backup(urllib.parse.unquote(path.split("/")[3]))
         elif path in {f"/energy/{metric}" for metric in METRICS}:
+            requested_view = query.get("view", query.get("tab", ["overview"]))[0]
+            detail_view = normalize_energy_detail_view(requested_view)
+            default_period = "all" if detail_view in ("payments", "imports") else "year"
             self.energy_detail_page(
                 path.split("/")[-1],
-                query.get("period", ["year"])[0],
+                query.get("period", [default_period])[0],
                 query.get("month", [""])[0],
                 notice,
+                detail_view,
             )
         elif path.startswith("/energy/tariffs/") and path.endswith("/edit"):
             self.energy_tariff_edit_page(int(path.split("/")[3]), notice)
@@ -1749,6 +3289,41 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/energy/sync":
                 messages = sync_home_assistant()
                 self.redirect("/energy?notice=" + urllib.parse.quote("; ".join(messages)))
+            elif path == "/settings/import-now":
+                messages = sync_all_sources()
+                notice = "; ".join(messages) or "Keine Sensoren konfiguriert."
+                self.redirect("/settings?notice=" + urllib.parse.quote(notice))
+            elif path == "/settings/sync-time":
+                raw = str(form.get("sync_time", "")).strip()
+                try:
+                    parsed = datetime.strptime(raw, "%H:%M")
+                except ValueError:
+                    raise ValueError("Bitte eine gültige Uhrzeit wählen.")
+                normalized = f"{parsed.hour:02d}:{parsed.minute:02d}"
+                with connect() as db:
+                    db.execute("""INSERT INTO meta(key,value) VALUES('sync_time',?)
+                                  ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (normalized,))
+                self.redirect("/settings?notice=" + urllib.parse.quote(f"Automatischer Import auf {normalized} Uhr eingestellt."))
+            elif path == "/settings/finanzlab":
+                self.save_finanzlab_settings(form)
+            elif path == "/settings/finanzlab-sync":
+                try:
+                    _count, messages = sync_finanzlab()
+                    notice = "; ".join(messages)
+                except Exception as exc:
+                    notice = f"Fehler beim Zahlungsabgleich: {exc}"
+                self.redirect("/settings?notice=" + urllib.parse.quote(notice))
+            elif path == "/settings/backups/create":
+                backup = create_automatic_backup("manuell")
+                if not backup:
+                    raise ValueError("Es gibt noch keine Datenbank zum Sichern.")
+                with connect() as db:
+                    db.execute("INSERT INTO backup_log(filename,reason,status) VALUES(?,?,'ok')", (backup.name, "Manuell"))
+                self.redirect("/settings?notice=" + urllib.parse.quote("Lokale Datenbanksicherung wurde erstellt."))
+            elif path.startswith("/settings/backups/") and path.endswith("/restore"):
+                filename = urllib.parse.unquote(path.split("/")[3])
+                restore_database_backup(filename)
+                self.redirect("/settings?notice=" + urllib.parse.quote("Sicherung wurde wiederhergestellt; zuvor wurde eine Sicherheitssicherung erstellt."))
             elif path == "/energy/backfill":
                 imported, messages = backfill_home_assistant(str(form.get("start_date", "")))
                 notice = f"{imported} tägliche Historienwerte übernommen. " + "; ".join(messages)
@@ -1763,6 +3338,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.save_energy_tariff(form)
             elif path.startswith("/energy/tariffs/") and path.endswith("/advance/save"):
                 self.save_advance_change(int(path.split("/")[3]), form)
+            elif path.startswith("/energy/tariffs/") and path.endswith("/payments/save"):
+                self.save_payment_event(int(path.split("/")[3]), form)
+            elif path.startswith("/energy/tariffs/") and "/payments/" in path and path.endswith("/cancel"):
+                self.cancel_payment_event(int(path.split("/")[3]), int(path.split("/")[5]))
+            elif path.startswith("/energy/tariffs/") and path.endswith("/settlements/finalize"):
+                self.finalize_settlement(int(path.split("/")[3]), form)
             elif path.startswith("/energy/tariffs/") and "/advance/" in path and path.endswith("/delete"):
                 self.delete_advance_change(int(path.split("/")[3]), int(path.split("/")[5]))
             elif path.startswith("/energy/tariffs/") and path.endswith("/update"):
@@ -1775,8 +3356,11 @@ class Handler(BaseHTTPRequestHandler):
             self.send_html(page("Fehler", f'<div class="notice warn">{esc(exc)}</div><a class="btn secondary" href="javascript:history.back()">Zurück</a>'), 400)
 
     def dashboard(self, period, notice):
-        period = period if period in ("month", "year", "all") else "month"
-        start, end = period_bounds(period)
+        period = period if period in ("month", "year", "contract", "all") else "month"
+        if period == "contract":
+            start, end = None, None
+        else:
+            start, end = period_bounds(period)
         period_clauses, args = ["is_valid=1"], []
         if start:
             period_clauses.append("read_on>=?")
@@ -1787,14 +3371,63 @@ class Handler(BaseHTTPRequestHandler):
         where = "WHERE " + " AND ".join(period_clauses)
         args = tuple(args)
         with connect() as db:
-            energy = {
-                metric: allocated_usage(db, reading_metric_for(metric), start, end, "grid_import" if metric == "pv_self" else metric)[0]
-                for metric in METRICS
-            }
-            costs = energy_costs(db, start, end)
             forecasts = {metric: settlement_forecast(db, metric) for metric in ("grid_import", "gas", "water", "wastewater")}
-            pv_saved = pv_savings(db, start, end)
+
+            if period == "contract":
+                energy = {metric: None for metric in METRICS}
+                costs = {}
+
+                for contract_metric in ("grid_import", "gas", "water", "wastewater"):
+                    active_contract = active_energy_tariff(db, contract_metric)
+                    if not active_contract:
+                        continue
+                    contract_start = active_contract["valid_from"]
+                    contract_end = tariff_end_or_today(active_contract)
+                    energy[contract_metric] = allocated_usage(
+                        db,
+                        reading_metric_for(contract_metric),
+                        contract_start,
+                        contract_end,
+                        contract_metric,
+                    )[0]
+                    costs[contract_metric] = energy_finances(
+                        db, contract_start, contract_end
+                    ).get(contract_metric, {}).get("cost")
+
+                grid_contract = active_energy_tariff(db, "grid_import")
+                if grid_contract:
+                    grid_start = grid_contract["valid_from"]
+                    grid_end = tariff_end_or_today(grid_contract)
+                    energy["pv_self"] = allocated_usage(
+                        db,
+                        reading_metric_for("pv_self"),
+                        grid_start,
+                        grid_end,
+                        "grid_import",
+                    )[0]
+                    pv_saved = pv_savings(db, grid_start, grid_end)
+                else:
+                    pv_saved = None
+            else:
+                energy = {
+                    metric: allocated_usage(db, reading_metric_for(metric), start, end, "grid_import" if metric == "pv_self" else metric)[0]
+                    for metric in METRICS
+                }
+                costs = energy_costs(db, start, end)
+                pv_saved = pv_savings(db, start, end)
             pv_saved_text = f"−{fmt_money(pv_saved)}" if pv_saved is not None else "–"
+
+            def dashboard_contract_result(metric_key):
+                if period != "contract":
+                    return ""
+                forecast = forecasts.get(metric_key)
+                projected = forecast.get("projected") if forecast else None
+                if not projected:
+                    return ""
+                balance = float(projected.get("balance") or 0.0)
+                if balance >= 0:
+                    return f'<div class="muted"><strong>Erstattung: {fmt_money(balance)}</strong></div>'
+                return f'<div class="muted"><strong style="color:var(--red)">Nachzahlung: −{fmt_money(abs(balance))}</strong></div>'
             fuel_clauses, fuel_args = [], []
             if start:
                 fuel_clauses.append("fueled_on>=?")
@@ -1816,11 +3449,11 @@ class Handler(BaseHTTPRequestHandler):
             distance = (totals["maxodo"] - totals["minodo"]) if totals["maxodo"] is not None and totals["minodo"] is not None else 0
             cards = "".join(
                 [
-                    self.metric_card("⚡", "Strombezug", energy.get("grid_import"), "kWh", f'<div class="muted">Kosten: {fmt_money(costs.get("grid_import"))}</div>' + sparkline(db, "grid_import"), f"/energy/grid_import?period={period}"),
+                    self.metric_card("⚡", "Strombezug", energy.get("grid_import"), "kWh", f'<div class="muted">Kosten: {fmt_money(costs.get("grid_import"))}</div>' + dashboard_contract_result("grid_import") + sparkline(db, "grid_import"), f"/energy/grid_import?period={period}"),
                     self.metric_card("☀️", "PV-Eigenverbrauch", energy.get("pv_self"), "kWh", f'<div class="muted">Dadurch gespart: {pv_saved_text}</div>' + sparkline(db, "pv_self"), f"/energy/pv_self?period={period}"),
-                    self.metric_card("🔥", "Gas", energy.get("gas"), "m³", f'<div class="muted">Kosten: {fmt_money(costs.get("gas"))}</div>' + sparkline(db, "gas"), f"/energy/gas?period={period}"),
-                    self.metric_card("💧", "Wasser", energy.get("water"), "m³", f'<div class="muted">Kosten: {fmt_money(costs.get("water"))}</div>' + sparkline(db, "water"), f"/energy/water?period={period}"),
-                    self.metric_card("🚰", "Abwasser", energy.get("wastewater"), "m³", f'<div class="muted">Kosten: {fmt_money(costs.get("wastewater"))}</div>' + sparkline(db, "water"), f"/energy/wastewater?period={period}"),
+                    self.metric_card("🔥", "Gas", energy.get("gas"), "m³", f'<div class="muted">Kosten: {fmt_money(costs.get("gas"))}</div>' + dashboard_contract_result("gas") + sparkline(db, "gas"), f"/energy/gas?period={period}"),
+                    self.metric_card("💧", "Wasser", energy.get("water"), "m³", f'<div class="muted">Kosten: {fmt_money(costs.get("water"))}</div>' + dashboard_contract_result("water") + sparkline(db, "water"), f"/energy/water?period={period}"),
+                    self.metric_card("🚰", "Abwasser", energy.get("wastewater"), "m³", f'<div class="muted">Kosten: {fmt_money(costs.get("wastewater"))}</div>' + dashboard_contract_result("wastewater") + sparkline(db, "water"), f"/energy/wastewater?period={period}"),
                     self.metric_card("🚐", f"{dashboard_vehicle_name} Ø-Verbrauch", diesel_avg, "l/100 km", f'<div class="muted">Gesamtkosten: {fmt_num(total_cost_per_km,3)} €/km</div>', "/vehicle-costs"),
                 ]
             )
@@ -1843,7 +3476,7 @@ class Handler(BaseHTTPRequestHandler):
             projected_label = "voraussichtliche Erstattung" if projected["balance"] >= 0 else "voraussichtliche Nachzahlung"
             projected_class = "ok" if projected["balance"] >= 0 else "warn"
             settlement_cards += f"""<div class="card settlement-card"><h3>{cfg['icon']} {esc(cfg['label'])}</h3><div class="contract">{esc(forecast['provider'] or 'Tarif')} · {esc(forecast['contract_start'])} bis {esc(forecast['contract_end'])}</div><div class="settlement-block"><strong>Stand bis {esc(forecast['data_until'])}</strong><div class="row muted"><span>Kosten</span><span>{fmt_money(current['cost'])}</span></div><div class="row muted"><span>anteilige Abschläge</span><span>{fmt_money(current['advance'])}</span></div><div class="row"><span>Zwischenstand</span><strong>{current_sign}{fmt_money(abs(current['balance']))}</strong></div></div><div class="settlement-block"><strong>Hochrechnung bis {esc(forecast['contract_end'])}</strong><div class="row muted"><span>Kosten</span><span>{fmt_money(projected['cost'])}</span></div><div class="row muted"><span>Abschläge</span><span>{fmt_money(projected['advance'])}</span></div><div class="row"><span>{projected_label}</span><strong class="amount {projected_class}">{fmt_money(abs(projected['balance']))}</strong></div></div></div>"""
-        labels = {"month": "Monat", "year": "Jahr", "all": "Gesamt"}
+        labels = {"month": "Monat", "year": "Jahr", "contract": "Vertragszeitraum", "all": "Gesamt"}
         tabs = "".join(f'<a class="{"active" if period==key else ""}" href="/?period={key}">{label}</a>' for key, label in labels.items())
         body = f"""<div class="topbar"><div><h1>Energie & Verbrauch</h1><div class="subtitle">Deine lokalen Verbrauchsdaten auf einen Blick</div></div><div class="tabs">{tabs}</div></div><div class="grid">{cards}</div><section class="section"><div class="section-head"><div><h2>Voraussichtliche Abrechnung</h2><div class="muted">Hochrechnung aus dem bisherigen Tagesverbrauch bis zum Ende des jeweils aktuellen Tarifzeitraums</div></div><a href="/energy/grid_import">Stromvertrag bearbeiten →</a></div><div class="settlement-grid">{settlement_cards}</div><p class="muted">Berechnung: Zahlungen − (Verbrauchskosten + Grundpreis). Ein positiver Saldo ergibt eine Erstattung, ein negativer eine Nachzahlung. Die PV-Ersparnis bleibt separat und reduziert die tatsächlichen Stromkosten nicht.</p></section><section class="section two"><div class="card"><div class="section-head"><h2>Fahrzeuge</h2><a href="/vehicle-costs">Fahrzeugkosten verwalten →</a></div><div class="table-wrap"><table><thead><tr><th>Fahrzeug</th><th>Diesel</th><th>Gesamtkosten/km</th><th>AdBlue</th><th>gefahren</th></tr></thead><tbody>{vehicle_rows or '<tr><td colspan="5" class="empty">Noch keine Fahrzeugdaten</td></tr>'}</tbody></table></div></div><div class="card metric"><div class="icon">€</div><div class="label">Tankkosten {labels[period]}</div><div class="value">{fmt_money(totals['cost'])}</div><div class="muted">{fmt_num(totals['liters'])} Liter · ca. {fmt_num(distance,0)} km</div><div class="actions" style="margin-top:20px"><a class="btn" href="/fuelings/new">+ Tankung</a><a class="btn secondary" href="/vehicle-costs">+ weitere Kosten</a></div></div></section>"""
         self.send_html(page("Dashboard", body, "/", notice))
@@ -1853,9 +3486,10 @@ class Handler(BaseHTTPRequestHandler):
         tag, end_tag = (f'<a class="card metric metric-link" href="{esc(href)}">', "</a>") if href else ('<div class="card metric">', "</div>")
         return f'{tag}<div class="icon">{icon}</div><div class="value">{fmt_num(value)} <small style="font-size:14px">{esc(unit)}</small></div><div class="label">{esc(label)}</div>{extra}{end_tag}'
 
-    def energy_metric_management(self, metric, tariffs):
+    def energy_metric_management(self, metric, tariffs, section="all"):
         if metric == "pv_self":
-            return '<section class="section card"><h2>Photovoltaik</h2><p class="muted">PV-Eigenverbrauch verwendet den gültigen Stromtarif. Ein eigener Vertrag oder Abschlag wird dafür nicht angelegt.</p></section>'
+            explanation = '<section class="section card"><h2>Photovoltaik</h2><p class="muted">PV-Eigenverbrauch verwendet den gültigen Stromtarif. Ein eigener Vertrag oder Abschlag wird dafür nicht angelegt.</p></section>'
+            return explanation if section in ("all", "contract") else ""
         csrf = csrf_for(self.cookie_token())
         cfg = METRICS[metric]
         default_interval = 3 if metric in ("water", "wastewater") else 1
@@ -1888,17 +3522,25 @@ class Handler(BaseHTTPRequestHandler):
             manual = f"""<section class="section card"><div class="section-head"><div><h2>Zählerstand manuell erfassen</h2><div class="muted">Auch rückwirkend möglich; angrenzende Verbrauchswerte werden neu berechnet.</div></div><span class="badge">manuell</span></div><form method="post" action="/energy/readings/save"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="metric" value="{metric}"><div class="form-grid"><div class="field"><label>Ablesedatum</label><input type="date" name="read_on" value="{date.today().isoformat()}" max="{date.today().isoformat()}" required></div><div class="field"><label>Zählerstand in {esc(cfg['unit'])}</label><input inputmode="decimal" name="total_value" placeholder="z. B. {example}" required></div></div><button class="btn" style="margin-top:16px">Zählerstand speichern</button></form></section>"""
         derived_note = '<p class="muted">Die Verbrauchsmenge stammt automatisch vom Wasserzähler. Kosten und Zahlungen bleiben vollständig getrennt.</p>' if metric == "wastewater" else ""
         form = f"""<section class="section card"><div class="section-head"><div><h2>{esc(cfg['label'])}-Vertrag hinzufügen</h2><div class="muted">Tarif, Grundpreis, Zahlungsrhythmus und FinanzLab-Konto werden historisch geführt.</div></div><span class="badge">{len(tariffs)} von {TARIFF_LIMIT}</span></div>{derived_note}<form method="post" action="/energy/tariffs/save"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="metric" value="{metric}"><div class="form-grid"><div class="field full"><label>Anbieter</label><input name="provider" maxlength="100" placeholder="z. B. Stadtwerke Musterstadt" required></div><div class="field"><label>Gültig von</label><input type="date" name="valid_from" required></div><div class="field"><label>Gültig bis</label><input type="date" name="valid_to"></div><div class="field"><label>{price_label}</label><input inputmode="decimal" name="price_per_kwh" placeholder="{price_placeholder}" required></div>{factor_field}<div class="field"><label>Grundpreis in €/Monat</label><input inputmode="decimal" name="base_fee_monthly" placeholder="z. B. 8,50" required></div><div class="field"><label>Betrag je Zahlung in €</label><input inputmode="decimal" name="advance_monthly" placeholder="z. B. 120,00" required></div><div class="field"><label>Zahlungsrhythmus</label><select name="payment_interval_months">{interval_options}</select></div><div class="field"><label>Zahlungstag</label><input type="number" name="payment_day" min="1" max="31" value="1" required></div><div class="field"><label>Erste Zahlung <span class="muted">(optional)</span></label><input type="date" name="first_payment_date"><span class="muted">Leer = automatisch aus Vertragsbeginn, Zahlungstag und Rhythmus.</span></div><div class="field full"><label>Konto in FinanzLab</label><input name="payment_account" maxlength="100" placeholder="exakter Kontoname, z. B. Girokonto"></div></div><button class="btn" style="margin-top:18px" {"disabled" if len(tariffs) >= TARIFF_LIMIT else ""}>Vertrag speichern</button></form></section>"""
-        history = f"""<section class="section card"><div class="section-head"><h2>Verträge und Zahlungen</h2><span class="badge">{len(tariffs)} Verträge</span></div><div class="table-wrap"><table><thead><tr><th>Anbieter</th><th>Von</th><th>Bis</th><th>Verbrauchspreis</th><th>Grundpreis</th><th>Zahlungsbetrag</th><th>Zahlung</th><th></th></tr></thead><tbody>{rows or '<tr><td colspan="8" class="empty">Noch kein Vertrag hinterlegt.</td></tr>'}</tbody></table></div></section>"""
-        return form + history + manual
+        history = f"""<section class="section card"><div class="section-head"><h2>Gespeicherte Verträge</h2><span class="badge">{len(tariffs)} Verträge</span></div><div class="table-wrap"><table><thead><tr><th>Anbieter</th><th>Von</th><th>Bis</th><th>Verbrauchspreis</th><th>Grundpreis</th><th>Zahlungsbetrag</th><th>Zahlung</th><th></th></tr></thead><tbody>{rows or '<tr><td colspan="8" class="empty">Noch kein Vertrag hinterlegt.</td></tr>'}</tbody></table></div></section>"""
+        contract_content = history + form
+        if section == "contract":
+            return contract_content
+        if section == "imports":
+            return manual
+        return contract_content + manual
 
-    def energy_detail_page(self, metric, period, requested_month="", notice=""):
+    def energy_detail_page(self, metric, period, requested_month="", notice="", view="overview"):
         cfg = METRICS[metric]
         reading_metric = reading_metric_for(metric)
-        period = period if period in ("month", "year", "all") else "year"
+        view = normalize_energy_detail_view(view)
+        period = period if period in ("month", "year", "contract", "all") else "year"
         current_month = date.today().replace(day=1)
         selected_month = month_start_from_query(requested_month) if period == "month" else None
         if selected_month:
             start_on, end_on = selected_month_bounds(selected_month)
+        elif period == "contract":
+            start_on, end_on = None, None
         else:
             start_on, end_on = period_bounds(period)
         clauses = ["metric=?"]
@@ -1915,18 +3557,60 @@ class Handler(BaseHTTPRequestHandler):
                 args,
             ).fetchall()
             tariff_metric = "grid_import" if metric == "pv_self" else metric
-            tariffs = db.execute(
-                "SELECT * FROM energy_tariffs WHERE metric=? ORDER BY valid_from DESC,id DESC",
-                (tariff_metric,),
-            ).fetchall()
+            tariffs = sorted(
+                db.execute(
+                    "SELECT * FROM energy_tariffs WHERE metric=? ORDER BY valid_from,id",
+                    (tariff_metric,),
+                ).fetchall(),
+                key=tariff_display_sort_key_for_row,
+            )
             earliest = db.execute(
                 "SELECT MIN(read_on) AS first_on FROM energy_readings WHERE metric=?",
                 (reading_metric,),
             ).fetchone()["first_on"]
+            latest_reading = db.execute(
+                """SELECT * FROM energy_readings WHERE metric=? AND is_valid=1
+                   ORDER BY read_on DESC,id DESC LIMIT 1""",
+                (reading_metric,),
+            ).fetchone()
+            sync_logs = db.execute(
+                "SELECT * FROM sync_log ORDER BY synced_at DESC,id DESC LIMIT 50"
+            ).fetchall()
+            active_contract = None
+            if period == "contract":
+                active_contract = active_energy_tariff(db, tariff_metric)
+                if active_contract:
+                    start_on = active_contract["valid_from"]
+                    end_on = tariff_end_or_today(active_contract)
+                    clauses = ["metric=?"]
+                    args = [reading_metric]
+                    clauses.append("read_on>=?")
+                    args.append(start_on)
+                    clauses.append("read_on<=?")
+                    args.append(end_on)
+                    readings = db.execute(
+                        f"SELECT * FROM energy_readings WHERE {' AND '.join(clauses)} ORDER BY read_on,id",
+                        args,
+                    ).fetchall()
             finances = energy_finances(db, start_on, end_on)
             pv_saved = pv_savings(db, start_on, end_on) if metric == "pv_self" else None
             historical_month = bool(selected_month and selected_month < current_month)
             forecast = settlement_forecast(db, metric) if metric in ("grid_import", "gas", "water", "wastewater") and not historical_month else None
+            if period == "contract" and forecast and forecast.get("projected"):
+                start_on = forecast["contract_start"]
+                end_on = forecast["contract_end"]
+                clauses = ["metric=?"]
+                args = [reading_metric]
+                clauses.append("read_on>=?")
+                args.append(start_on)
+                clauses.append("read_on<=?")
+                args.append(end_on)
+                readings = db.execute(
+                    f"SELECT * FROM energy_readings WHERE {' AND '.join(clauses)} ORDER BY read_on,id",
+                    args,
+                ).fetchall()
+                finances = energy_finances(db, start_on, end_on)
+                pv_saved = pv_savings(db, start_on, end_on) if metric == "pv_self" else None
             total_consumption = allocated_usage(db, reading_metric, start_on, end_on, tariff_metric)[0]
             reading_costs = {}
             previous_valid_day = None
@@ -1936,13 +3620,36 @@ class Handler(BaseHTTPRequestHandler):
                     interval_start = (previous_valid_day + timedelta(days=1)) if previous_valid_day else current_valid_day
                     reading_costs[item["read_on"]] = allocated_usage(db, reading_metric, interval_start.isoformat(), item["read_on"], tariff_metric)[1]
                 previous_valid_day = current_valid_day
+            payment_sections = (
+                energy_payment_plan_sections(db, metric, start_on, end_on)
+                if view == "payments" else []
+            )
 
-        labels = {"month": "Monat", "year": "Jahr", "all": "Gesamt"}
-        month_href = f"/energy/{metric}?period=month"
-        if selected_month:
-            month_href += f"&month={selected_month:%Y-%m}"
-        tabs = "".join(
-            f'<a class="{"active" if period == key else ""}" href="{month_href if key == "month" else f"/energy/{metric}?period={key}"}">{label}</a>'
+        labels = {"month": "Monat", "year": "Jahr", "contract": "Vertragszeitraum", "all": "Gesamt"}
+
+        def detail_href(target_view, target_period=None, target_month=None):
+            params = {"view": target_view}
+            if target_period:
+                params["period"] = target_period
+            if target_month:
+                params["month"] = target_month
+            return f"/energy/{metric}?" + urllib.parse.urlencode(params)
+
+        view_labels = (
+            ("overview", "▦", "Übersicht"),
+            ("contract", "▤", "Vertrag"),
+            ("payments", "€", "Zahlungsplan"),
+            ("imports", "⇩", "Importhistorie"),
+        )
+        primary_tabs = "".join(
+            f'<a class="{"active" if view == key else ""}" '
+            f'href="{esc(detail_href(key, period if key != "contract" else None, selected_month.strftime("%Y-%m") if selected_month and key != "contract" else None))}" '
+            f'{"aria-current=page" if view == key else ""}><span aria-hidden="true">{icon}</span>{label}</a>'
+            for key, icon, label in view_labels
+        )
+        period_tabs = "".join(
+            f'<a class="{"active" if period == key else ""}" '
+            f'href="{esc(detail_href(view, key, selected_month.strftime("%Y-%m") if key == "month" and selected_month else None))}">{label}</a>'
             for key, label in labels.items()
         )
         month_navigation = ""
@@ -1951,17 +3658,17 @@ class Handler(BaseHTTPRequestHandler):
             previous_month = shift_month(selected_month, -1) if selected_month > earliest_month else None
             next_month = shift_month(selected_month, 1) if selected_month < current_month else None
             previous_control = (
-                f'<a class="month-arrow" href="/energy/{metric}?period=month&month={previous_month:%Y-%m}" aria-label="Vorheriger Monat">‹</a>'
+                f'<a class="month-arrow" href="{esc(detail_href(view, "month", previous_month.strftime("%Y-%m")))}" aria-label="Vorheriger Monat">‹</a>'
                 if previous_month
                 else '<span class="month-arrow disabled" aria-disabled="true" title="Erster Monat mit Quelldaten">‹</span>'
             )
             next_control = (
-                f'<a class="month-arrow" href="/energy/{metric}?period=month&month={next_month:%Y-%m}" aria-label="Nächster Monat">›</a>'
+                f'<a class="month-arrow" href="{esc(detail_href(view, "month", next_month.strftime("%Y-%m")))}" aria-label="Nächster Monat">›</a>'
                 if next_month
                 else '<span class="month-arrow disabled" aria-disabled="true" title="Aktueller Monat">›</span>'
             )
             current_control = (
-                f'<a class="btn secondary current-month-link" href="/energy/{metric}?period=month">Zum aktuellen Monat</a>'
+                f'<a class="btn secondary current-month-link" href="{esc(detail_href(view, "month"))}">Zum aktuellen Monat</a>'
                 if selected_month < current_month
                 else '<span class="btn secondary current-month-link disabled" aria-disabled="true">Zum aktuellen Monat</span>'
             )
@@ -2015,41 +3722,182 @@ class Handler(BaseHTTPRequestHandler):
             source = "manuell" if row["source"] == "manual" else (row["source"] or "Home Assistant")
             if metric == "wastewater":
                 source = "vom Wasserzähler übernommen"
-            reading_rows += f"""<tr{row_class}><td>{date.fromisoformat(row['read_on']).strftime('%d.%m.%Y')}</td><td><strong>{fmt_num(row['total_value'])} {esc(row['unit'])}</strong></td><td>{fmt_num(delta) + ' ' + esc(cfg['unit']) if delta is not None else '–'}</td>{f'<td>{fmt_num(converted)} kWh</td>' if metric == 'gas' else ''}<td>{esc(tariff_text)}</td><td>{price_text}</td><td>{fmt_money(amount)}</td><td>{esc(source)}<br><span class="muted">{esc(row['entity_id'])}</span></td><td>{status}</td></tr>"""
+            reading_rows += f"""<tr{row_class}><td>{date.fromisoformat(row['read_on']).strftime('%d.%m.%Y')}</td><td><strong>{fmt_num(row['total_value'])} {esc(row['unit'])}</strong></td><td>{fmt_num(delta) + ' ' + esc(cfg['unit']) if delta is not None else '–'}</td>{f'<td>{fmt_num(converted)} kWh</td>' if metric == 'gas' else ''}<td>{esc(tariff_text)}</td><td>{price_text}</td><td>{fmt_money(amount)}</td><td><span class="source-detail"><strong>{esc(source)}</strong><span class="muted">{esc(row['entity_id'] or 'ohne Sensor-ID')}</span><span class="muted">eingelesen {esc(row['created_at'])}</span></span></td><td>{status}</td></tr>"""
 
         period_caption = month_label(selected_month) if selected_month else labels[period]
-        summary_boxes = [
-            f'<div class="summary-box"><div class="muted">Verbrauch {period_caption}</div><div class="value">{fmt_num(total_consumption)} {esc(cfg["unit"])}</div></div>'
-        ]
+        contract_values = forecast.get("projected") if period == "contract" and forecast and forecast.get("projected") else None
+        if period == "contract" and active_contract:
+            contract_caption = f'Vertrag {esc(active_contract["valid_from"])} bis {esc(active_contract["valid_to"] or "offen")}'
+        elif contract_values:
+            contract_caption = f'Vertrag {esc(forecast["contract_start"])} bis {esc(forecast["contract_end"])}'
+        else:
+            contract_caption = period_caption
+        # Kein DB-Zugriff hier: Die Datenbank ist an dieser Stelle bereits geschlossen.
+        # Verbrauch, Kosten, Grundpreis und Abschläge stammen aus demselben
+        # ausgewählten Zeitraum. Hochrechnungen werden nur separat angezeigt.
+        display_consumption = total_consumption
+        display_converted_total = converted_total
+
+        summary_boxes = []
+        if latest_reading:
+            latest_source = "Wasserzähler" if metric == "wastewater" else (
+                "manuell" if latest_reading["source"] == "manual" else "automatisch"
+            )
+            summary_boxes.append(
+                f'<div class="summary-box"><div class="muted">Aktueller Zählerstand</div>'
+                f'<div class="value">{fmt_num(latest_reading["total_value"])} {esc(cfg["unit"])}</div>'
+                f'<div class="muted">vom {date.fromisoformat(latest_reading["read_on"]).strftime("%d.%m.%Y")} · {esc(latest_source)}</div></div>'
+            )
+        summary_boxes.append(
+            f'<div class="summary-box"><div class="muted">Verbrauch {contract_caption}</div><div class="value">{fmt_num(display_consumption)} {esc(cfg["unit"])}</div></div>'
+        )
         if metric == "gas":
-            summary_boxes.append(f'<div class="summary-box"><div class="muted">umgerechnet</div><div class="value">{fmt_num(converted_total)} kWh</div></div>')
+            summary_boxes.append(f'<div class="summary-box"><div class="muted">umgerechnet</div><div class="value">{fmt_num(display_converted_total)} kWh</div></div>')
         if metric == "pv_self":
             summary_boxes.append(f'<div class="summary-box"><div class="muted">Dadurch gespart</div><div class="value">−{fmt_money(pv_saved)}</div></div>')
         elif values:
+            # The summary boxes must use the same selected period as the displayed
+            # consumption. Forecast/projected values are shown separately below.
+            display_values = values
             summary_boxes.extend(
                 [
-                    f'<div class="summary-box"><div class="muted">Verbrauchskosten</div><div class="value">{fmt_money(values["variable"])}</div></div>',
-                    f'<div class="summary-box"><div class="muted">Grundpreis</div><div class="value">{fmt_money(values["base_fee"])}</div></div>',
-                    f'<div class="summary-box"><div class="muted">Gesamtkosten</div><div class="value">{fmt_money(values["cost"])}</div></div>',
-                    f'<div class="summary-box"><div class="muted">Abschläge</div><div class="value">{fmt_money(values["advance"])}</div></div>',
+                    f'<div class="summary-box"><div class="muted">Verbrauchskosten</div><div class="value">{fmt_money(display_values["variable"])}</div></div>',
+                    f'<div class="summary-box"><div class="muted">Grundpreis</div><div class="value">{fmt_money(display_values["base_fee"])}</div></div>',
+                    f'<div class="summary-box"><div class="muted">Gesamtkosten</div><div class="value">{fmt_money(display_values["cost"])}</div></div>',
+                    f'<div class="summary-box"><div class="muted">Abschläge</div><div class="value">{fmt_money(display_values["advance"])}</div></div>',
                 ]
             )
+        forecast_explanation = ""
         if forecast and forecast.get("projected"):
             projected_balance = forecast["projected"]["balance"]
             projected_label = "Voraussichtliche Erstattung" if projected_balance >= 0 else "Voraussichtliche Nachzahlung"
             projected_class = "ok" if projected_balance >= 0 else "warn"
-            summary_boxes.append(f'<div class="summary-box"><div class="muted">{projected_label} bis {esc(forecast["contract_end"])}</div><div class="value {projected_class}">{fmt_money(abs(projected_balance))}</div></div>')
+            basis_labels = {
+                "planned": "Zahlungsbasis: Vertragsplan",
+                "actual": "Zahlungsbasis: bestätigte Ist-Zahlungen",
+                "actual_plus_planned": "Zahlungsbasis: Ist bis heute + künftiger Plan",
+            }
+            payment_basis = forecast["projected"].get("payment_basis", "planned")
+            basis_label = basis_labels.get(payment_basis, "Zahlungsbasis: Vertragsplan")
+            quality_label = forecast.get("quality_label", "Hochrechnung")
+            quality_class = "ok" if forecast.get("quality") == "good" else "warn"
+            summary_boxes.append(
+                f'<div class="summary-box"><div class="muted">{projected_label} bis {esc(forecast["contract_end"])}</div>'
+                f'<div class="value {projected_class}">{fmt_money(abs(projected_balance))}</div>'
+                f'<div class="meta"><span class="badge {quality_class}">{esc(quality_label)}</span><br>{esc(basis_label)}</div>'
+                f'<div class="meta">Zahlungsbasis Hochrechnung: {fmt_money(forecast["projected"].get("advance", 0))}</div>'
+                f'<div class="meta">Kosten Hochrechnung: {fmt_money(forecast["projected"].get("cost", 0))}</div>'
+                f'</div>'
+            )
+            missing_count = len(forecast["projected"].get("missing_due_dates") or [])
+            missing_note = (
+                f" {missing_count} vergangene Zahlung(en) werden laut Vertragsplan berücksichtigt."
+                if missing_count else ""
+            )
+            forecast_explanation = (
+                f'<div class="notice {"" if forecast.get("quality") == "good" else "warn"} forecast-note">'
+                f'<strong>Orientierungswert – keine garantierte Schlussrechnung</strong>'
+                f'{esc(forecast.get("method") or "Hochrechnung aus dem bisherigen Verbrauch")}. '
+                f'{esc(basis_label)}.{esc(missing_note)}</div>'
+            )
 
         anomaly_html = f'<div class="notice warn">{invalid_count} unplausible oder während eines Ausfalls erfasste Werte sind rot markiert und werden in Verbrauch und Kosten nicht berücksichtigt.</div>' if invalid_count else ""
         gas_help = '<p class="muted">Beim Gas werden für jeden Tag der Zählerverbrauch in m³, der gültige Umrechnungsfaktor in kWh/m³ und die daraus berechneten kWh getrennt angezeigt.</p>' if metric == "gas" else ""
         derived_help = '<div class="notice">Abwasser verwendet automatisch dieselben Verbrauchsmengen und Zählerstände wie Wasser. Kosten, Vertrag, Grundpreis und Zahlungen werden dennoch vollständig getrennt berechnet.</div>' if metric == "wastewater" else ""
         conversion_header = "<th>Umgerechnet</th>" if metric == "gas" else ""
-        management = self.energy_metric_management(metric, tariffs)
-        body = f"""<div class="topbar"><div><a href="/">← Dashboard</a><h1 style="margin-top:8px">{cfg['icon']} {esc(cfg['label'])}</h1><div class="subtitle">Messwerte, Kosten, Vertrag, Zahlungen und Historie</div></div><div class="tabs">{tabs}</div></div>{month_navigation}{derived_help}{anomaly_html}<div class="card"><div class="summary-grid">{"".join(summary_boxes)}</div></div>{management}<section class="section card"><div class="section-head"><h2>Tagesverbrauch</h2><div class="chart-legend"><span class="legend-line">gültige Werte</span></div></div><div class="table-wrap">{detail_chart(readings, 'delta_value', cfg['unit'])}</div></section><section class="section card"><div class="section-head"><h2>Zählerstand und Ausfälle</h2><div class="chart-legend"><span class="legend-line">gültiger Verlauf</span><span class="legend-invalid">ausgeschlossen</span></div></div><div class="table-wrap">{detail_chart(readings, 'total_value', cfg['unit'], True)}</div></section><section class="section card"><div class="section-head"><div><h2>Alle Messwerte</h2>{gas_help}</div><span class="badge">{len(readings)} Einträge</span></div><div class="table-wrap"><table><thead><tr><th>Datum</th><th>Zählerstand</th><th>Verbrauch</th>{conversion_header}<th>Tarif / Faktor</th><th>Arbeitspreis</th><th>{'Ersparnis' if metric == 'pv_self' else 'Kosten'}</th><th>Quelle</th><th>Prüfung</th></tr></thead><tbody>{reading_rows or '<tr><td colspan="9" class="empty">In diesem Zeitraum sind noch keine Werte vorhanden.</td></tr>'}</tbody></table></div></section>"""
+        contract_management = self.energy_metric_management(metric, tariffs, "contract")
+        import_management = self.energy_metric_management(metric, tariffs, "imports")
+
+        def render_payment_rows(items):
+            rendered = ""
+            for item in items:
+                due_label = date.fromisoformat(item["due_on"]).strftime("%d.%m.%Y")
+                if item["period_from"]:
+                    period_label = (
+                        f'{date.fromisoformat(item["period_from"]).strftime("%d.%m.%Y")} bis '
+                        f'{date.fromisoformat(item["period_to"]).strftime("%d.%m.%Y")}'
+                    )
+                else:
+                    period_label = "Sonderbuchung ohne Verbrauchszeitraum"
+                planned_label = fmt_money(item["planned"]) if item["planned"] is not None else "–"
+                actual_label = fmt_money(item["actual"]) if item["actual_available"] else "noch nicht bestätigt"
+                money_class = "ok" if item["balance"] >= 0 else "warn"
+                rendered += f"""<tr><td><strong>{due_label}</strong></td><td>{period_label}</td><td><span class="plan-payment"><span class="muted">Plan {planned_label}</span><strong>Ist {actual_label}</strong></span></td><td>{fmt_money(item['base_fee'])}</td><td>{fmt_num(item['consumption']) + ' ' + esc(cfg['unit']) if item['consumption'] is not None else '–'}</td><td>{fmt_money(item['variable_cost'])}</td><td><strong>{fmt_money(item['total_cost'])}</strong></td><td><strong class="{money_class}">{fmt_money(item['balance'])}</strong></td><td><span class="badge {item['status_class']}">{esc(item['status'])}</span></td></tr>"""
+            return rendered
+
+        payment_sections_html = ""
+        payment_basis_labels = {
+            "planned": "Vertragsplan",
+            "actual": "bestätigte Ist-Zahlungen",
+            "actual_plus_planned": "bestätigte Ist-Zahlungen + offene Planbeträge",
+        }
+        for section in payment_sections:
+            section_from = date.fromisoformat(section["period_from"]).strftime("%d.%m.%Y")
+            section_to = date.fromisoformat(section["period_to"]).strftime("%d.%m.%Y")
+            calculated_to = (
+                date.fromisoformat(section["calculated_to"]).strftime("%d.%m.%Y")
+                if section["calculated_to"] else "noch nicht begonnen"
+            )
+            actual_total = fmt_money(section["actual"]) if section["actual_available"] else "–"
+            section_summary = [
+                f'<div class="summary-box"><div class="muted">Plan-Zahlungen</div><div class="value">{fmt_money(section["planned"])}</div><div class="meta">im gewählten Zeitraum</div></div>',
+                f'<div class="summary-box"><div class="muted">Bestätigte Ist-Zahlungen</div><div class="value">{actual_total}</div><div class="meta">im gewählten Zeitraum</div></div>',
+                f'<div class="summary-box"><div class="muted">Anteilige Grundgebühr</div><div class="value">{fmt_money(section["base_fee"])}</div><div class="meta">bis {calculated_to}</div></div>',
+                f'<div class="summary-box"><div class="muted">Verbrauch</div><div class="value">{fmt_num(section["consumption"])} {esc(cfg["unit"])}</div><div class="meta">bis {calculated_to}</div></div>',
+                f'<div class="summary-box"><div class="muted">Verbrauchskosten</div><div class="value">{fmt_money(section["variable_cost"])}</div><div class="meta">bis {calculated_to}</div></div>',
+                f'<div class="summary-box"><div class="muted">Gesamtkosten</div><div class="value">{fmt_money(section["total_cost"])}</div><div class="meta">Grundgebühr + Verbrauch</div></div>',
+                f'<div class="summary-box supplier-result"><div class="muted">{esc(section["result_label"])}</div><div class="value {section["result_class"]}">{fmt_money(abs(section["balance"]))}</div><div class="meta">Basis: {esc(payment_basis_labels.get(section["payment_basis"], "Vertragsplan"))}</div></div>',
+            ]
+            missing_count = len(section["missing_due_dates"])
+            missing_note = (
+                f'<div class="notice warn supplier-note">{missing_count} fällige Zahlung(en) sind noch nicht bestätigt; für den Zwischenstand gilt dort weiterhin der Vertragsplan.</div>'
+                if missing_count else ""
+            )
+            boundary_dates = ", ".join(
+                date.fromisoformat(value).strftime("%d.%m.%Y")
+                for value in section["missing_boundary_readings"]
+            )
+            boundary_note = (
+                '<div class="notice warn supplier-note"><strong>Wechselstand fehlt.</strong> '
+                f'Für {esc(boundary_dates)} ist noch ein gültiger Zählerstand nötig. '
+                'Die Lieferantenabrechnung bleibt bis dahin ausdrücklich vorläufig.</div>'
+                if boundary_dates else ""
+            )
+            rows_for_section = render_payment_rows(section["rows"])
+            payment_sections_html += f"""<section class="section card supplier-payment-section" data-tariff-id="{section['tariff_id']}"><div class="supplier-header"><div><div class="supplier-kicker">Lieferant · eigener Tarifabschnitt</div><h2>{esc(section['provider'])}</h2><div class="muted">{section_from} bis {section_to} · {esc(payment_interval_label(section['payment_interval_months']))}</div></div><div class="supplier-badges"><span class="badge">Tarif {section['tariff_id']}</span><span class="badge {'ok' if section['final'] else 'warn'}">{'abgeschlossen' if section['final'] else 'vorläufig'}</span></div></div><div class="summary-grid supplier-summary">{"".join(section_summary)}</div>{missing_note}{boundary_note}<div class="table-wrap supplier-table"><table class="payment-plan-table"><thead><tr><th>Fälligkeit</th><th>Kostenzeitraum</th><th>Plan / Ist</th><th>Grundgebühr</th><th>Verbrauch</th><th>Verbrauchskosten</th><th>Gesamtkosten</th><th>Saldo</th><th>Status</th></tr></thead><tbody>{rows_for_section or '<tr><td colspan="9" class="empty">In diesem Tarifabschnitt liegt keine Abschlagsfälligkeit. Die anteiligen Kosten stehen trotzdem vollständig in der Zusammenfassung.</td></tr>'}</tbody></table></div></section>"""
+        if not payment_sections_html:
+            payment_sections_html = '<div class="card empty">Für diesen Zeitraum ist noch kein Tarif mit Zahlungsplan vorhanden.</div>'
+        sync_rows = "".join(
+            f'<tr><td>{esc(item["synced_at"])}</td><td><span class="badge {"ok" if item["status"] == "ok" else "warn"}">{esc(item["status"])}</span></td><td style="white-space:normal">{esc(item["message"])}</td></tr>'
+            for item in sync_logs
+        )
+
+        overview_content = f"""{derived_help}{anomaly_html}<div class="card"><div class="summary-grid">{"".join(summary_boxes)}</div></div>{forecast_explanation}<section class="section card"><div class="section-head"><h2>Verbrauch im Verlauf</h2><div class="chart-legend"><span class="legend-line">gültige Werte</span></div></div><div class="table-wrap">{detail_chart(readings, 'delta_value', cfg['unit'])}</div></section><section class="section card"><div class="section-head"><h2>Zählerstand im Verlauf</h2><div class="chart-legend"><span class="legend-line">gültiger Verlauf</span><span class="legend-invalid">ausgeschlossen</span></div></div><div class="table-wrap">{detail_chart(readings, 'total_value', cfg['unit'], True)}</div></section>"""
+        contract_content = f"""{derived_help}<div class="detail-intro"><h2>Tarife und Vertragslaufzeiten</h2><p class="muted">Hier findest du zuerst deine bestehenden Verträge. Neue Zeiträume kannst du direkt darunter ergänzen.</p></div>{contract_management}"""
+        payments_content = f"""<div class="detail-intro"><h2>Abschläge und Zahlungsstand</h2><p class="muted">Jeder Lieferanten- und Tarifwechsel beginnt einen eigenen Abschnitt. Kein Verbrauch, Grundpreis oder Saldo wird über eine Tarifgrenze hinweg zusammengefasst.</p></div>{payment_sections_html}<p class="muted section">Saldo je Tarifabschnitt: bestätigte Ist-Zahlungen plus noch offene Planbeträge, abzüglich anteiliger Grundgebühr und Verbrauchskosten. Rücklastschriften und Sonderzahlungen bleiben in ihrem zugehörigen Tarifabschnitt nachvollziehbar.</p>"""
+        history_colspan = 10 if metric == "gas" else 9
+        imports_content = f"""{derived_help}{import_management}{anomaly_html}<div class="detail-intro section"><h2>Eingelesene Zählerstände</h2><p class="muted">Alle Werte bleiben mit Datenquelle, Einlesezeitpunkt und Ergebnis der Plausibilitätsprüfung nachvollziehbar.</p></div><section class="card"><div class="section-head"><div><h2>Importhistorie</h2>{gas_help}</div><span class="badge">{len(readings)} Einträge</span></div><div class="table-wrap"><table><thead><tr><th>Datum</th><th>Zählerstand</th><th>Verbrauch</th>{conversion_header}<th>Tarif / Faktor</th><th>Arbeitspreis</th><th>{'Ersparnis' if metric == 'pv_self' else 'Kosten'}</th><th>Quelle / eingelesen</th><th>Prüfung</th></tr></thead><tbody>{reading_rows or f'<tr><td colspan="{history_colspan}" class="empty">In diesem Zeitraum sind noch keine Werte vorhanden.</td></tr>'}</tbody></table></div></section><section class="section card"><div class="section-head"><h2>Letzte Importläufe</h2><span class="badge">{len(sync_logs)} Einträge</span></div><div class="table-wrap"><table><thead><tr><th>Zeit</th><th>Status</th><th>Meldung</th></tr></thead><tbody>{sync_rows or '<tr><td colspan="3" class="empty">Noch kein Import protokolliert.</td></tr>'}</tbody></table></div></section>"""
+        contents = {
+            "overview": overview_content,
+            "contract": contract_content,
+            "payments": payments_content,
+            "imports": imports_content,
+        }
+        view_titles = {
+            "overview": "Aktueller Stand und Verbrauch",
+            "contract": "Vertragsdaten",
+            "payments": "Zahlungsplan",
+            "imports": "Importhistorie",
+        }
+        period_toolbar = ""
+        if view != "contract":
+            period_toolbar = f'<div class="detail-toolbar"><div><strong>{esc(view_titles[view])}</strong><div class="muted">Zeitraum auswählen</div></div><div class="tabs" aria-label="Zeitraum">{period_tabs}</div></div>{month_navigation}'
+        body = f"""<div class="topbar"><div><a href="/">← Dashboard</a><h1 style="margin-top:8px">{cfg['icon']} {esc(cfg['label'])}</h1><div class="subtitle">Stand, Vertrag, Zahlungen und eingelesene Daten getrennt im Blick</div></div></div><nav class="tabs detail-primary-tabs" aria-label="Bereiche">{primary_tabs}</nav>{period_toolbar}<div class="detail-view">{contents[view]}</div>"""
         self.send_html(page(f"{cfg['label']} Details", body, f"/energy/{metric}", notice, "Fehler" in notice))
 
     def energy_page(self, notice):
         token = self.cookie_token()
+        scheduled_hour, scheduled_minute = sync_time()
         with connect() as db:
             latest = {r["metric"]: r for r in db.execute("SELECT e.* FROM energy_readings e JOIN (SELECT metric,MAX(read_on) d FROM energy_readings WHERE is_valid=1 GROUP BY metric) x ON x.metric=e.metric AND x.d=e.read_on WHERE e.is_valid=1")}
             logs = db.execute("SELECT * FROM sync_log ORDER BY id DESC LIMIT 12").fetchall()
@@ -2134,7 +3982,7 @@ class Handler(BaseHTTPRequestHandler):
             cfg = METRICS[metric]
             example = "12.345,67" if metric == "grid_import" else "1.234,567"
             manual_forms += f"""<form class="card" method="post" action="/energy/readings/save"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="metric" value="{metric}"><div class="section-head"><h2>{cfg['icon']} {esc(cfg['label'])}</h2><span class="badge">manuell</span></div><div class="field"><label>Ablesedatum</label><input type="date" name="read_on" value="{date.today().isoformat()}" max="{date.today().isoformat()}" required></div><div class="field" style="margin-top:12px"><label>Zählerstand in {esc(cfg['unit'])}</label><input inputmode="decimal" name="total_value" placeholder="z. B. {example}" required></div><button class="btn" style="margin-top:16px">Zählerstand speichern</button></form>"""
-        body = f"""<div class="topbar"><div><h1>Energie</h1><div class="subtitle">Tägliche Zählerstände aus Home Assistant · automatisch um {SYNC_HOUR:02d}:{SYNC_MINUTE:02d} Uhr · {readiness}</div></div><form method="post" action="/energy/sync"><input type="hidden" name="csrf" value="{csrf}"><button class="btn">Jetzt synchronisieren</button></form></div>{anomaly_html}
+        body = f"""<div class="topbar"><div><h1>Energie</h1><div class="subtitle">Tägliche Zählerstände aus Home Assistant · automatisch um {scheduled_hour:02d}:{scheduled_minute:02d} Uhr · {readiness}</div></div><form method="post" action="/energy/sync"><input type="hidden" name="csrf" value="{csrf}"><button class="btn">Jetzt synchronisieren</button></form></div>{anomaly_html}
         <div class="card"><div class="table-wrap"><table><thead><tr><th>Messgröße</th><th>Datenquelle</th><th>Letzter Stand</th><th>Datum</th><th>Verbrauchskosten</th><th>Grundpreis</th><th>Gesamtkosten</th><th>Abschläge</th><th>Zwischenstand</th><th>Hochrechnung</th><th>PV-Ersparnis</th></tr></thead><tbody>{rows}</tbody></table></div><p class="muted" style="padding:0 28px 22px">Verbrauchskosten + Grundpreis = Gesamtkosten. Die Hochrechnung verwendet den bisherigen durchschnittlichen Tagesverbrauch bis zum Tarifende. Die PV-Ersparnis wird separat mit dem gültigen Strom-Arbeitspreis berechnet und reduziert diese Kosten nicht.</p></div>
         <section class="section"><div class="section-head"><div><h2>Zählerstände manuell erfassen</h2><div class="muted">Auch rückwirkend möglich. Der Stand muss chronologisch zwischen dem vorherigen und dem nachfolgenden Zählerstand liegen.</div></div></div><div class="grid">{manual_forms}</div><p class="muted">Eine Eingabe für ein bereits vorhandenes Datum korrigiert diesen Wert. Danach werden Verbrauch, historische Tarifkosten und Salden automatisch neu berechnet.</p></section>
         <section class="section card"><div class="section-head"><h2>Letzte manuelle Wasserstände</h2></div><div class="table-wrap"><table><thead><tr><th>Datum</th><th>Zählerstand</th><th>Verbrauch seit davor</th></tr></thead><tbody>{waterrows or '<tr><td colspan="3" class="empty">Noch keine Wasserstände erfasst</td></tr>'}</tbody></table></div></section>
@@ -2162,6 +4010,9 @@ class Handler(BaseHTTPRequestHandler):
             ).fetchone()
             if overlap:
                 raise ValueError("Für diesen Zeitraum besteht bereits ein Tarif. Bitte Zeiträume lückenlos, aber ohne Überschneidung anlegen.")
+            validate_tariff_timeline_neighbors(
+                db, values["metric"], values["valid_from"], values["valid_to"]
+            )
             db.execute(
                 "INSERT INTO energy_tariffs(metric,provider,valid_from,valid_to,price_per_kwh,kwh_per_unit,base_fee_monthly,advance_monthly,payment_day,payment_interval_months,first_payment_date,payment_account) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (values["metric"], values["provider"], values["valid_from"], values["valid_to"], values["price"], values["factor"], values["base_fee"], values["advance"], values["payment_day"], values["payment_interval_months"], values["first_payment_date"], values["payment_account"]),
@@ -2177,6 +4028,14 @@ class Handler(BaseHTTPRequestHandler):
                 "SELECT * FROM energy_advance_changes WHERE tariff_id=? ORDER BY valid_from,id",
                 (tariff_id,),
             ).fetchall()
+            payment_events = db.execute(
+                "SELECT * FROM energy_payment_events WHERE tariff_id=? ORDER BY booked_on DESC,id DESC",
+                (tariff_id,),
+            ).fetchall()
+            snapshots = db.execute(
+                "SELECT * FROM energy_settlement_snapshots WHERE tariff_id=? ORDER BY period_to DESC,revision DESC,id DESC",
+                (tariff_id,),
+            ).fetchall()
         if not tariff:
             self.send_html(page("Nicht gefunden", '<div class="card empty">Tarif nicht gefunden.</div>'), 404)
             return
@@ -2189,19 +4048,1116 @@ class Handler(BaseHTTPRequestHandler):
             price_label = "Arbeitspreis in Cent/kWh"
             price_value = fmt_num(tariff["price_per_kwh"] * 100, 2)
         change_rows = "".join(
-            f"""<tr><td>{esc(change['valid_from'][:7])}</td><td>{fmt_money(change['advance_monthly'])} je Zahlung</td><td><form method="post" action="/energy/tariffs/{tariff_id}/advance/{change['id']}/delete" onsubmit="return confirm('Zahlungsänderung wirklich löschen?')"><input type="hidden" name="csrf" value="{csrf_for(token)}"><button style="border:0;background:none;color:#ff8e98;cursor:pointer">Löschen</button></form></td></tr>"""
+            f"""<tr><td>{esc(change['valid_from'])}</td><td>{fmt_money(change['advance_monthly'])} je Zahlung</td><td><form method="post" action="/energy/tariffs/{tariff_id}/advance/{change['id']}/delete" onsubmit="return confirm('Zahlungsänderung wirklich löschen?')"><input type="hidden" name="csrf" value="{csrf_for(token)}"><button style="border:0;background:none;color:#ff8e98;cursor:pointer">Löschen</button></form></td></tr>"""
             for change in advance_changes
         )
         interval_options = "".join(f'<option value="{months}" {"selected" if months == tariff["payment_interval_months"] else ""}>{text}</option>' for months, text in ((1,"monatlich"),(3,"quartalsweise"),(6,"halbjährlich"),(12,"jährlich")))
         body = f"""<div class="topbar"><div><h1>{label} bearbeiten</h1><div class="subtitle">Vertragsdaten und historische Zahlungsänderungen verwalten</div></div></div><div class="card"><form method="post" action="/energy/tariffs/{tariff_id}/update"><input type="hidden" name="csrf" value="{csrf_for(token)}"><input type="hidden" name="metric" value="{esc(tariff['metric'])}"><div class="form-grid"><div class="field full"><label>Anbieter</label><input name="provider" maxlength="100" value="{esc(tariff['provider'])}" required></div><div class="field"><label>Gültig von</label><input type="date" name="valid_from" value="{esc(tariff['valid_from'])}" required></div><div class="field"><label>Gültig bis</label><input type="date" name="valid_to" value="{esc(tariff['valid_to'] or '')}"></div><div class="field"><label>{price_label}</label><input inputmode="decimal" name="price_per_kwh" value="{price_value}" required></div>{factor_field}<div class="field"><label>Grundpreis in €/Monat</label><input inputmode="decimal" name="base_fee_monthly" value="{fmt_num(tariff['base_fee_monthly'], 2)}" required></div><div class="field"><label>Ursprünglicher Betrag je Zahlung</label><input inputmode="decimal" name="advance_monthly" value="{fmt_num(tariff['advance_monthly'], 2)}" required></div><div class="field"><label>Zahlungsrhythmus</label><select name="payment_interval_months">{interval_options}</select></div><div class="field"><label>Zahlungstag</label><input type="number" name="payment_day" min="1" max="31" value="{tariff['payment_day']}" required></div><div class="field"><label>Erste Zahlung <span class="muted">(optional)</span></label><input type="date" name="first_payment_date" value="{esc(tariff['first_payment_date'] or '')}" min="{esc(tariff['valid_from'])}" {f'max="{esc(tariff["valid_to"])}"' if tariff['valid_to'] else ''}><span class="muted">Leer = automatisch berechnen.</span></div><div class="field full"><label>Konto in FinanzLab</label><input name="payment_account" maxlength="100" value="{esc(tariff['payment_account'])}" placeholder="exakter Kontoname, z. B. Girokonto"></div></div><p class="muted">Den ursprünglichen Betrag nur korrigieren, wenn er falsch erfasst wurde. Spätere Änderungen bitte unten mit Gültigkeitsmonat anlegen.</p><div class="actions" style="margin-top:18px"><button class="btn">Vertragsdaten speichern</button><a class="btn secondary" href="/energy/{tariff['metric']}">Zurück</a></div></form></div>
-        <section class="section card"><div class="section-head"><div><h2>Zahlungsbetrag ändern, ohne den Vertrag neu anzulegen</h2><div class="muted">Frühere Zahlungen bleiben erhalten. Der neue Betrag gilt ab dem gewählten Monat für den gespeicherten Rhythmus.</div></div></div><form method="post" action="/energy/tariffs/{tariff_id}/advance/save"><input type="hidden" name="csrf" value="{csrf_for(token)}"><div class="form-grid"><div class="field"><label>Neuer Betrag gültig ab Monat</label><input type="month" name="valid_month" value="{date.today().strftime('%Y-%m')}" min="{esc(tariff['valid_from'][:7])}" {f'max="{esc(tariff["valid_to"][:7])}"' if tariff['valid_to'] else ''} required></div><div class="field"><label>Neuer Betrag je Zahlung</label><input inputmode="decimal" name="advance_monthly" placeholder="z. B. 145,00" required></div></div><button class="btn" style="margin-top:18px">Zahlungsänderung speichern</button></form><div class="table-wrap" style="margin-top:22px"><table><thead><tr><th>Gültig ab Monat</th><th>Zahlungsbetrag</th><th></th></tr></thead><tbody>{change_rows or '<tr><td colspan="3" class="empty">Noch keine spätere Zahlungsänderung erfasst</td></tr>'}</tbody></table></div></section>"""
+        <section class="section card"><div class="section-head"><div><h2>Zahlungsbetrag ändern, ohne den Vertrag neu anzulegen</h2><div class="muted">Frühere Zahlungen bleiben erhalten. Der neue Betrag gilt ab dem gewählten Datum für danach fällige Zahlungen.</div></div></div><form method="post" action="/energy/tariffs/{tariff_id}/advance/save"><input type="hidden" name="csrf" value="{csrf_for(token)}"><div class="form-grid"><div class="field"><label>Neuer Betrag gültig ab</label><input type="date" name="valid_from" value="{date.today().isoformat()}" min="{esc(tariff['valid_from'])}" {f'max="{esc(tariff["valid_to"])}"' if tariff['valid_to'] else ''} required></div><div class="field"><label>Neuer Betrag je Zahlung</label><input inputmode="decimal" name="advance_monthly" placeholder="z. B. 145,00" required></div></div><button class="btn" style="margin-top:18px">Zahlungsänderung speichern</button></form><div class="table-wrap" style="margin-top:22px"><table><thead><tr><th>Gültig ab</th><th>Zahlungsbetrag</th><th></th></tr></thead><tbody>{change_rows or '<tr><td colspan="3" class="empty">Noch keine spätere Zahlungsänderung erfasst</td></tr>'}</tbody></table></div></section>"""
+        event_options = "".join(f'<option value="{key}">{esc(value)}</option>' for key, value in PAYMENT_EVENT_LABELS.items())
+        event_rows = ""
+        for event in payment_events:
+            status_class = "ok" if event["confirmed"] and event["status"] not in ("cancelled", "reversed", "pending", "review") else "warn"
+            status_label = "berücksichtigt" if status_class == "ok" and event["event_type"] != "suspension" else ("ausgesetzt" if event["event_type"] == "suspension" else "nicht berücksichtigt")
+            cancel = ""
+            if event["status"] not in ("cancelled", "reversed"):
+                cancel = f'''<form method="post" action="/energy/tariffs/{tariff_id}/payments/{event['id']}/cancel" onsubmit="return confirm('Ereignis wirklich stornieren? Der Prüfverlauf bleibt erhalten.')"><input type="hidden" name="csrf" value="{csrf_for(token)}"><button class="link-button danger-text">Stornieren</button></form>'''
+            event_rows += f"""<tr><td>{esc(event['booked_on'])}</td><td>{esc(event['due_on'] or '–')}</td><td>{esc(PAYMENT_EVENT_LABELS.get(event['event_type'], event['event_type']))}</td><td class="{'negative' if float(event['amount']) < 0 else ''}">{fmt_money(event['amount'])}</td><td>{esc(event['source'])}<br><span class="muted">{esc(event['match_method'] or event['note'])}</span></td><td><span class="badge {status_class}">{status_label}</span></td><td>{cancel}</td></tr>"""
+        snapshot_rows = "".join(
+            f"""<tr><td>{esc(item['period_from'])} bis {esc(item['period_to'])}</td><td>Revision {item['revision']}</td><td>{esc(item['title'] or 'Schlussabrechnung')}</td><td>{esc(item['created_at'])}</td><td><a href="/settlements/{item['id']}">Öffnen →</a></td></tr>"""
+            for item in snapshots
+        )
+        end_default = tariff["valid_to"] or date.today().isoformat()
+        body += f"""<section class="section card"><div class="section-head"><div><h2>Ist-Zahlungen und Sonderfälle</h2><div class="muted">Bestätigte Bankzahlungen kommen automatisch aus FinanzLab. Manuelle Einträge sind für Sonderfälle oder den Betrieb ohne Bankabgleich gedacht.</div></div><span class="badge">Plan ≠ Ist</span></div><details class="inline-details"><summary>Ein Ereignis manuell erfassen</summary><div class="details-body"><form method="post" action="/energy/tariffs/{tariff_id}/payments/save"><input type="hidden" name="csrf" value="{csrf_for(token)}"><div class="form-grid"><div class="field"><label>Art</label><select name="event_type">{event_options}</select></div><div class="field"><label>Buchungsdatum</label><input type="date" name="booked_on" value="{date.today().isoformat()}" required></div><div class="field"><label>Zugehörige Fälligkeit <span class="muted">(optional)</span></label><input type="date" name="due_on"></div><div class="field"><label>Betrag in €</label><input inputmode="decimal" name="amount" value="0,00" required><span class="muted">Rücklastschrift und Guthabenauszahlung werden automatisch negativ gerechnet; Korrekturen dürfen ein Vorzeichen haben.</span></div><div class="field full"><label>Notiz</label><input name="note" maxlength="500" placeholder="z. B. Abschlag im Juni ausgesetzt"></div></div><button class="btn" style="margin-top:18px">Ereignis erfassen</button></form></div></details><div class="table-wrap" style="margin-top:18px"><table><thead><tr><th>Gebucht</th><th>Fälligkeit</th><th>Art</th><th>Wirkung</th><th>Quelle</th><th>Status</th><th></th></tr></thead><tbody>{event_rows or '<tr><td colspan="7" class="empty">Noch keine Ist-Zahlungen erfasst oder aus FinanzLab abgeglichen.</td></tr>'}</tbody></table></div></section>
+        <section class="section card">
+<div class="section-head">
+<div>
+<h2>Schlussabrechnung fixieren</h2>
+<div class="muted">
+Speichert die Werte der echten Schlussrechnung zusätzlich zur EnergieLab-Berechnung als unveränderliche Revision mit SHA-256-Prüfsumme.
+</div>
+</div>
+<span class="badge ok">revisionssicher</span>
+</div>
+
+<form method="post"
+      action="/energy/tariffs/{tariff_id}/settlements/finalize">
+
+<input type="hidden"
+       name="csrf"
+       value="{csrf_for(token)}">
+
+<div class="form-grid">
+
+<div class="field">
+<label>Abrechnung von</label>
+<input type="date"
+       name="period_from"
+       value="{esc(tariff['valid_from'])}"
+       min="{esc(tariff['valid_from'])}"
+       required>
+</div>
+
+<div class="field">
+<label>bis</label>
+<input type="date"
+       name="period_to"
+       value="{esc(end_default)}"
+       {f'max="{esc(tariff["valid_to"])}"' if tariff['valid_to'] else ''}
+       required>
+</div>
+
+<div class="field">
+<label>
+Rechnungsdatum
+<span class="muted">(optional)</span>
+</label>
+<input type="date"
+       name="invoice_date">
+</div>
+
+<div class="field">
+<label>Verbrauch laut Schlussrechnung</label>
+<input inputmode="decimal"
+       name="supplier_consumption"
+       placeholder="kWh bei Strom/Gas · m³ bei Wasser/Abwasser"
+       required>
+</div>
+
+<div class="field">
+<label>
+Gasmenge laut Rechnung in m³
+<span class="muted">(nur Gas, optional)</span>
+</label>
+<input inputmode="decimal"
+       name="supplier_meter_consumption">
+</div>
+
+<div class="field">
+<label>
+Zählerstand Anfang
+<span class="muted">(optional)</span>
+</label>
+<input inputmode="decimal"
+       name="meter_start">
+</div>
+
+<div class="field">
+<label>
+Zählerstand Ende
+<span class="muted">(optional)</span>
+</label>
+<input inputmode="decimal"
+       name="meter_end">
+</div>
+
+<div class="field">
+<label>Rechnungsbetrag laut Schlussrechnung in €</label>
+<input inputmode="decimal"
+       name="invoice_total_cost"
+       id="final-invoice-total-{tariff_id}"
+       placeholder="z. B. 1240,50"
+       required>
+</div>
+
+<div class="field">
+<label>Gezahlte / berücksichtigte Abschläge in €</label>
+<input inputmode="decimal"
+       name="invoice_paid"
+       id="final-invoice-paid-{tariff_id}"
+       placeholder="wird aus dem Zahlungsplan übernommen"
+       required>
+
+<div class="actions"
+     style="margin-top:8px">
+<button type="button"
+        class="btn secondary"
+        data-use-plan>
+Aus Zahlungsplan übernehmen
+</button>
+</div>
+
+<span class="muted"
+      data-plan-info>
+Zahlungsplan wird berechnet …
+</span>
+</div>
+
+<div class="field full">
+<label>Ergebnis der Schlussrechnung</label>
+
+<div class="card"
+     style="padding:14px;margin-top:4px"
+     data-settlement-result>
+Rechnungsbetrag und Abschläge eingeben.
+</div>
+
+<span class="muted">
+Automatische Berechnung:
+Abschläge − Rechnungsbetrag.
+</span>
+</div>
+
+<div class="field full">
+<label>
+Bezeichnung
+<span class="muted">(optional)</span>
+</label>
+<input name="title"
+       maxlength="160"
+       placeholder="z. B. Schlussrechnung 2026">
+</div>
+
+<div class="field full">
+<label class="checks">
+<input type="checkbox"
+       name="close_contract"
+       value="1"
+       checked>
+Vertragszeitraum mit dieser Schlussrechnung beenden
+</label>
+
+<span class="muted">
+Setzt das Vertragsende auf den letzten Abrechnungstag.
+Bei einer reinen Jahresabrechnung eines weiterlaufenden
+Vertrags den Haken entfernen.
+</span>
+</div>
+
+</div>
+
+<button class="btn"
+        style="margin-top:18px">
+Schlussabrechnung unveränderlich fixieren
+</button>
+
+</form>
+
+<script>
+(() => {{
+  const form = document.querySelector(
+    'form[action="/energy/tariffs/{tariff_id}/settlements/finalize"]'
+  );
+
+  if (!form) return;
+
+  const fromInput =
+    form.querySelector('[name="period_from"]');
+
+  const toInput =
+    form.querySelector('[name="period_to"]');
+
+  const totalInput =
+    form.querySelector('[name="invoice_total_cost"]');
+
+  const paidInput =
+    form.querySelector('[name="invoice_paid"]');
+
+  const planInfo =
+    form.querySelector('[data-plan-info]');
+
+  const resultBox =
+    form.querySelector('[data-settlement-result]');
+
+  const usePlanButton =
+    form.querySelector('[data-use-plan]');
+
+  let manualPaid = false;
+
+  const parseNumber = (raw) => {{
+    let value = String(raw || "")
+      .trim()
+      .replace(/\\s/g, "");
+
+    if (!value) return null;
+
+    if (value.includes(",") && value.includes(".")) {{
+      if (
+        value.lastIndexOf(",")
+        > value.lastIndexOf(".")
+      ) {{
+        value = value
+          .replace(/\\./g, "")
+          .replace(",", ".");
+      }} else {{
+        value = value.replace(/,/g, "");
+      }}
+    }} else if (value.includes(",")) {{
+      value = value.replace(",", ".");
+    }}
+
+    const number = Number(value);
+
+    return Number.isFinite(number)
+      ? number
+      : null;
+  }};
+
+  const formatMoney = (value) =>
+    new Intl.NumberFormat(
+      "de-DE",
+      {{
+        style: "currency",
+        currency: "EUR"
+      }}
+    ).format(value);
+
+  const updateBalance = () => {{
+    const total = parseNumber(totalInput.value);
+    const paid = parseNumber(paidInput.value);
+
+    if (total === null || paid === null) {{
+      resultBox.textContent =
+        "Rechnungsbetrag und Abschläge eingeben.";
+      return;
+    }}
+
+    const balance =
+      Math.round((paid - total) * 100) / 100;
+
+    if (balance > 0.004) {{
+      resultBox.textContent =
+        "Erstattung / Guthaben: "
+        + formatMoney(balance);
+    }} else if (balance < -0.004) {{
+      resultBox.textContent =
+        "Nachzahlung: "
+        + formatMoney(Math.abs(balance));
+    }} else {{
+      resultBox.textContent =
+        "Ausgeglichen: 0,00 €";
+    }}
+  }};
+
+  const loadPlan = (force) => {{
+    if (!fromInput.value || !toInput.value) {{
+      return;
+    }}
+
+    planInfo.textContent =
+      "Zahlungsplan wird berechnet …";
+
+    const url =
+      "/api/energy/tariffs/{tariff_id}/planned-payments"
+      + "?from="
+      + encodeURIComponent(fromInput.value)
+      + "&to="
+      + encodeURIComponent(toInput.value);
+
+    fetch(url)
+      .then((response) => response.json())
+      .then((data) => {{
+        if (data.error) {{
+          planInfo.textContent =
+            "Zahlungsplan konnte nicht berechnet werden: "
+            + data.error;
+          return;
+        }}
+
+        const amount =
+          Number(data.amount || 0);
+
+        const count =
+          Number(data.count || 0);
+
+        planInfo.textContent =
+          "Zahlungsplan: "
+          + formatMoney(amount)
+          + " · "
+          + count
+          + " Abschlag"
+          + (count === 1 ? "" : "e");
+
+        if (force || !manualPaid) {{
+          paidInput.value =
+            amount
+              .toFixed(2)
+              .replace(".", ",");
+
+          manualPaid = false;
+          updateBalance();
+        }}
+      }})
+      .catch(() => {{
+        planInfo.textContent =
+          "Zahlungsplan konnte nicht geladen werden.";
+      }});
+  }};
+
+  paidInput.addEventListener(
+    "input",
+    () => {{
+      manualPaid = true;
+      updateBalance();
+    }}
+  );
+
+  totalInput.addEventListener(
+    "input",
+    updateBalance
+  );
+
+  fromInput.addEventListener(
+    "change",
+    () => {{
+      manualPaid = false;
+      loadPlan(true);
+    }}
+  );
+
+  toInput.addEventListener(
+    "change",
+    () => {{
+      manualPaid = false;
+      loadPlan(true);
+    }}
+  );
+
+  usePlanButton.addEventListener(
+    "click",
+    () => {{
+      manualPaid = false;
+      loadPlan(true);
+    }}
+  );
+
+  loadPlan(true);
+  updateBalance();
+}})();
+</script>
+
+<div class="table-wrap"
+     style="margin-top:22px">
+
+<table>
+
+<thead>
+<tr>
+<th>Zeitraum</th>
+<th>Stand</th>
+<th>Bezeichnung</th>
+<th>Fixiert am</th>
+<th></th>
+</tr>
+</thead>
+
+<tbody>
+{snapshot_rows or '<tr><td colspan="5" class="empty">Noch keine Schlussabrechnung fixiert.</td></tr>'}
+</tbody>
+
+</table>
+</div>
+</section>"""
         self.send_html(page(f"{label} bearbeiten", body, f"/energy/{tariff['metric']}", notice))
 
+
+    def finalize_settlement(self, tariff_id, form):
+        period_from = str(form.get("period_from", "")).strip()
+        period_to = str(form.get("period_to", "")).strip()
+        title = str(form.get("title", "")).strip()
+        invoice_date = str(form.get("invoice_date", "")).strip()
+        close_contract = str(form.get("close_contract", "")) == "1"
+
+        if invoice_date:
+            try:
+                date.fromisoformat(invoice_date)
+            except ValueError:
+                raise ValueError("Das Rechnungsdatum ist ungültig.")
+
+        def form_num(name, label, required=False, allow_negative=False):
+            raw_value = str(form.get(name, "")).strip()
+            if not raw_value:
+                if required:
+                    raise ValueError(f"{label} ist erforderlich.")
+                return None
+
+            value = parse_num(raw_value)
+            if value is None:
+                raise ValueError(f"{label} ist ungültig.")
+
+            value = float(value)
+
+            if not allow_negative and value < 0:
+                raise ValueError(f"{label} darf nicht negativ sein.")
+
+            return value
+
+        supplier_consumption = form_num(
+            "supplier_consumption",
+            "Verbrauch laut Schlussrechnung",
+            required=True,
+        )
+
+        supplier_meter_consumption = form_num(
+            "supplier_meter_consumption",
+            "Gasmenge laut Schlussrechnung",
+        )
+
+        meter_start = form_num(
+            "meter_start",
+            "Zählerstand Anfang",
+        )
+
+        meter_end = form_num(
+            "meter_end",
+            "Zählerstand Ende",
+        )
+
+        invoice_total_cost = form_num(
+            "invoice_total_cost",
+            "Gesamtkosten laut Schlussrechnung",
+            required=True,
+        )
+
+        invoice_paid = form_num(
+            "invoice_paid",
+            "Berücksichtigte Abschläge/Zahlungen",
+            required=True,
+        )
+
+        if (
+            meter_start is not None
+            and meter_end is not None
+            and meter_end < meter_start
+        ):
+            raise ValueError(
+                "Der Endzählerstand darf nicht kleiner als der Anfangszählerstand sein."
+            )
+
+        with connect() as db:
+            tariff = db.execute(
+                "SELECT * FROM energy_tariffs WHERE id=?",
+                (tariff_id,),
+            ).fetchone()
+
+            if not tariff:
+                raise ValueError("Tarif nicht gefunden.")
+
+            payload = settlement_snapshot_payload(
+                db,
+                tariff_id,
+                period_from,
+                period_to,
+            )
+
+            planned_paid_advances = round(
+                float(
+                    payload["settlement"]["plannedPayments"]
+                    or 0
+                ),
+                2,
+            )
+
+            invoice_total_cost = round(
+                float(invoice_total_cost),
+                2,
+            )
+
+            invoice_paid = round(
+                float(invoice_paid),
+                2,
+            )
+
+            # EnergieLab-Konvention:
+            # positiv = Erstattung/Guthaben
+            # negativ = Nachzahlung
+            invoice_balance = round(
+                invoice_paid - invoice_total_cost,
+                2,
+            )
+
+            paid_advances_source = (
+                "plan"
+                if abs(
+                    invoice_paid
+                    - planned_paid_advances
+                ) < 0.005
+                else "manual"
+            )
+
+            metric = tariff["metric"]
+
+            supplier_unit = (
+                "kWh"
+                if metric in ("grid_import", "gas")
+                else "m³"
+            )
+
+            if (
+                metric == "gas"
+                and supplier_meter_consumption is None
+                and meter_start is not None
+                and meter_end is not None
+            ):
+                supplier_meter_consumption = meter_end - meter_start
+
+            calculated_meter_amount = float(
+                payload["consumption"]["amount"] or 0
+            )
+            calculated_meter_unit = payload["consumption"]["unit"]
+
+            if metric == "gas":
+                calculated_billing_amount = (
+                    calculated_meter_amount
+                    * float(tariff["kwh_per_unit"] or 0)
+                )
+                calculated_billing_unit = "kWh"
+            else:
+                calculated_billing_amount = calculated_meter_amount
+                calculated_billing_unit = calculated_meter_unit
+
+            payload["schemaVersion"] = "3"
+
+            payload["supplierInvoice"] = {
+                "invoiceDate": invoice_date or None,
+
+                "consumption": {
+                    "amount": supplier_consumption,
+                    "unit": supplier_unit,
+                },
+
+                "meterConsumption": (
+                    {
+                        "amount": supplier_meter_consumption,
+                        "unit": "m³",
+                    }
+                    if (
+                        metric == "gas"
+                        and supplier_meter_consumption is not None
+                    )
+                    else None
+                ),
+
+                "meterStart": meter_start,
+                "meterEnd": meter_end,
+
+                "totalCost": invoice_total_cost,
+
+                # EnergieLab-Vorschlag aus dem Zahlungsplan
+                "plannedPaidAdvances": planned_paid_advances,
+
+                # Auf der echten Schlussrechnung berücksichtigter Betrag.
+                # Im Formular automatisch vorbelegt, aber überschreibbar.
+                "paidAdvances": invoice_paid,
+                "paidAdvancesSource": paid_advances_source,
+
+                # EnergieLab-Konvention:
+                # positiv = Erstattung
+                # negativ = Nachzahlung
+                "balance": invoice_balance,
+
+                "balanceConvention":
+                    "positive=refund,negative=additional_payment",
+            }
+
+            payload["calculatedBillingConsumption"] = {
+                "amount": calculated_billing_amount,
+                "unit": calculated_billing_unit,
+            }
+
+            payload["comparison"] = {
+                "billingConsumptionDifference":
+                    supplier_consumption
+                    - calculated_billing_amount,
+
+                "totalCostDifference":
+                    invoice_total_cost
+                    - float(
+                        payload["settlement"]["totalCost"] or 0
+                    ),
+
+                "balanceDifference":
+                    invoice_balance
+                    - float(
+                        payload["settlement"]["balance"] or 0
+                    ),
+            }
+
+            if close_contract:
+                invalid_change = db.execute(
+                    """
+                    SELECT 1
+                    FROM energy_advance_changes
+                    WHERE tariff_id=?
+                      AND valid_from>?
+                    LIMIT 1
+                    """,
+                    (tariff_id, period_to),
+                ).fetchone()
+
+                if invalid_change:
+                    raise ValueError(
+                        "Nach dem gewählten Vertragsende existiert noch "
+                        "eine Abschlagsänderung. Bitte diese zuerst "
+                        "korrigieren oder löschen."
+                    )
+
+                overlapping_tariff = db.execute(
+                    """
+                    SELECT 1
+                    FROM energy_tariffs
+                    WHERE id<>?
+                      AND metric=?
+                      AND valid_from<=?
+                      AND COALESCE(valid_to,'9999-12-31')>=?
+                    LIMIT 1
+                    """,
+                    (
+                        tariff_id,
+                        metric,
+                        period_to,
+                        period_to,
+                    ),
+                ).fetchone()
+
+                if overlapping_tariff:
+                    raise ValueError(
+                        "Der gewählte Abschlusstag überschneidet sich "
+                        "mit einem anderen Tarifzeitraum."
+                    )
+
+                db.execute(
+                    """
+                    UPDATE energy_tariffs
+                    SET valid_to=?
+                    WHERE id=?
+                    """,
+                    (period_to, tariff_id),
+                )
+
+                payload["contract"]["validTo"] = period_to
+                payload["contract"]["closedByFinalSettlement"] = True
+
+            else:
+                payload["contract"]["closedByFinalSettlement"] = False
+
+            revision = db.execute(
+                """
+                SELECT COALESCE(MAX(revision),0)+1 revision
+                FROM energy_settlement_snapshots
+                WHERE tariff_id=?
+                  AND period_from=?
+                  AND period_to=?
+                """,
+                (
+                    tariff_id,
+                    payload["period"]["from"],
+                    payload["period"]["to"],
+                ),
+            ).fetchone()["revision"]
+
+            payload["revision"] = revision
+
+            raw = json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+
+            digest = hashlib.sha256(
+                raw.encode("utf-8")
+            ).hexdigest()
+
+            cur = db.execute(
+                """
+                INSERT INTO energy_settlement_snapshots(
+                    tariff_id,
+                    revision,
+                    period_from,
+                    period_to,
+                    title,
+                    payment_basis,
+                    payload_json,
+                    payload_sha256
+                )
+                VALUES(?,?,?,?,?,'planned',?,?)
+                """,
+                (
+                    tariff_id,
+                    revision,
+                    payload["period"]["from"],
+                    payload["period"]["to"],
+                    title[:160],
+                    raw,
+                    digest,
+                ),
+            )
+
+            snapshot_id = cur.lastrowid
+
+        notice = (
+            f"Schlussabrechnung als Revision {revision} "
+            "unveränderlich fixiert."
+        )
+
+        if close_contract:
+            notice += " Der Vertragszeitraum wurde beendet."
+
+        self.redirect(
+            f"/settlements/{snapshot_id}?notice="
+            + urllib.parse.quote(notice)
+        )
+
+
+    def settlement_snapshot_page(self, snapshot_id):
+        query = urllib.parse.parse_qs(
+            urllib.parse.urlparse(self.path).query
+        )
+
+        notice = str(
+            query.get("notice", [""])[0]
+        )
+
+        with connect() as db:
+            row = db.execute(
+                """
+                SELECT *
+                FROM energy_settlement_snapshots
+                WHERE id=?
+                """,
+                (snapshot_id,),
+            ).fetchone()
+
+        if not row:
+            self.send_html(
+                page(
+                    "Nicht gefunden",
+                    '<div class="card empty">'
+                    'Schlussabrechnung nicht gefunden.'
+                    '</div>',
+                ),
+                404,
+            )
+            return
+
+        raw = row["payload_json"]
+        payload = json.loads(raw)
+
+        actual_digest = hashlib.sha256(
+            raw.encode("utf-8")
+        ).hexdigest()
+
+        verified = hmac.compare_digest(
+            actual_digest,
+            row["payload_sha256"],
+        )
+
+        contract = payload.get("contract", {})
+        supplier = payload.get("supplierInvoice", {})
+        supplier_consumption = (
+            supplier.get("consumption") or {}
+        )
+        supplier_meter = (
+            supplier.get("meterConsumption") or {}
+        )
+
+        calculated_consumption = (
+            payload.get("calculatedBillingConsumption")
+            or payload.get("consumption")
+            or {}
+        )
+
+        settlement = payload.get("settlement", {})
+        comparison = payload.get("comparison", {})
+
+        metric = contract.get("metric", "")
+
+        label = {
+            "grid_import": "Strom",
+            "gas": "Gas",
+            "water": "Wasser",
+            "wastewater": "Abwasser",
+        }.get(
+            metric,
+            metric or "Energie",
+        )
+
+        def optional_num(value, digits=2):
+            if value is None:
+                return "–"
+
+            return fmt_num(value, digits)
+
+        def balance_text(value):
+            if value is None:
+                return "–"
+
+            value = float(value)
+
+            if value > 0:
+                return (
+                    f"Erstattung {fmt_money(value)}"
+                )
+
+            if value < 0:
+                return (
+                    f"Nachzahlung {fmt_money(abs(value))}"
+                )
+
+            return "ausgeglichen"
+
+        gas_meter_row = ""
+
+        if metric == "gas":
+            gas_meter_row = (
+                '<div class="row muted">'
+                '<span>Gasmenge laut Rechnung</span>'
+                f'<span>{optional_num(supplier_meter.get("amount"))} '
+                'm³</span>'
+                '</div>'
+            )
+
+        meter_rows = ""
+
+        if (
+            supplier.get("meterStart") is not None
+            or supplier.get("meterEnd") is not None
+        ):
+            meter_unit = (
+                "kWh"
+                if metric == "grid_import"
+                else "m³"
+            )
+
+            meter_rows = (
+                '<div class="row muted">'
+                '<span>Zählerstand Anfang</span>'
+                f'<span>{optional_num(supplier.get("meterStart"))} '
+                f'{meter_unit}</span>'
+                '</div>'
+
+                '<div class="row muted">'
+                '<span>Zählerstand Ende</span>'
+                f'<span>{optional_num(supplier.get("meterEnd"))} '
+                f'{meter_unit}</span>'
+                '</div>'
+            )
+
+        status_class = (
+            "ok"
+            if verified
+            else "warn"
+        )
+
+        status_text = (
+            "SHA-256 geprüft"
+            if verified
+            else "Prüfsumme stimmt NICHT"
+        )
+
+        body = f"""
+        <div class="topbar">
+          <div>
+            <h1>Schlussabrechnung · {esc(label)}</h1>
+            <div class="subtitle">
+              {esc(contract.get('provider') or 'Tarif')}
+              ·
+              {esc(payload.get('period', {}).get('from', ''))}
+              bis
+              {esc(payload.get('period', {}).get('to', ''))}
+            </div>
+          </div>
+
+          <a class="btn secondary"
+             href="/energy/tariffs/{row['tariff_id']}/edit">
+             Zum Vertrag
+          </a>
+        </div>
+
+        <section class="section card">
+          <div class="section-head">
+            <div>
+              <h2>{esc(row['title'] or 'Schlussabrechnung')}</h2>
+              <div class="muted">
+                Revision {row['revision']}
+                · fixiert am {esc(row['created_at'])}
+              </div>
+            </div>
+
+            <span class="badge {status_class}">
+              {status_text}
+            </span>
+          </div>
+
+          <div class="muted"
+               style="word-break:break-all">
+            SHA-256: {esc(row['payload_sha256'])}
+          </div>
+        </section>
+
+        <section class="section two">
+
+          <div class="card settlement-card">
+            <h2>Schlussrechnung des Anbieters</h2>
+
+            <div class="settlement-block">
+
+              <div class="row muted">
+                <span>Rechnungsdatum</span>
+                <span>
+                  {esc(supplier.get('invoiceDate') or '–')}
+                </span>
+              </div>
+
+              <div class="row">
+                <span>Verbrauch</span>
+                <strong>
+                  {optional_num(
+                      supplier_consumption.get('amount')
+                  )}
+                  {esc(
+                      supplier_consumption.get('unit') or ''
+                  )}
+                </strong>
+              </div>
+
+              {gas_meter_row}
+
+              {meter_rows}
+
+              <div class="row muted">
+                <span>Gesamtkosten</span>
+                <span>
+                  {fmt_money(
+                      supplier.get('totalCost') or 0
+                  )}
+                </span>
+              </div>
+
+              <div class="row muted">
+                <span>berücksichtigte Abschläge</span>
+                <span>
+                  {fmt_money(
+                      supplier.get('paidAdvances') or 0
+                  )}
+                </span>
+              </div>
+
+              <div class="row">
+                <span>Endsaldo</span>
+                <strong>
+                  {balance_text(
+                      supplier.get('balance')
+                  )}
+                </strong>
+              </div>
+
+            </div>
+          </div>
+
+
+          <div class="card settlement-card">
+            <h2>EnergieLab-Berechnung</h2>
+
+            <div class="settlement-block">
+
+              <div class="row">
+                <span>Verbrauch</span>
+                <strong>
+                  {optional_num(
+                      calculated_consumption.get('amount')
+                  )}
+                  {esc(
+                      calculated_consumption.get('unit') or ''
+                  )}
+                </strong>
+              </div>
+
+              <div class="row muted">
+                <span>Gesamtkosten</span>
+                <span>
+                  {fmt_money(
+                      settlement.get('totalCost') or 0
+                  )}
+                </span>
+              </div>
+
+              <div class="row muted">
+                <span>Abschläge laut Zahlungsplan</span>
+                <span>
+                  {fmt_money(
+                      settlement.get('plannedPayments') or 0
+                  )}
+                </span>
+              </div>
+
+              <div class="row">
+                <span>Saldo</span>
+                <strong>
+                  {balance_text(
+                      settlement.get('balance')
+                  )}
+                </strong>
+              </div>
+
+            </div>
+          </div>
+
+        </section>
+
+
+        <section class="section card">
+          <div class="section-head">
+            <h2>Abweichungen Anbieter − EnergieLab</h2>
+          </div>
+
+          <div class="settlement-block">
+
+            <div class="row">
+              <span>Verbrauch</span>
+              <strong>
+                {optional_num(
+                    comparison.get(
+                        'billingConsumptionDifference'
+                    )
+                )}
+                {esc(
+                    calculated_consumption.get('unit') or ''
+                )}
+              </strong>
+            </div>
+
+            <div class="row">
+              <span>Gesamtkosten</span>
+              <strong>
+                {fmt_money(
+                    comparison.get(
+                        'totalCostDifference'
+                    ) or 0
+                )}
+              </strong>
+            </div>
+
+            <div class="row">
+              <span>Saldo</span>
+              <strong>
+                {fmt_money(
+                    comparison.get(
+                        'balanceDifference'
+                    ) or 0
+                )}
+              </strong>
+            </div>
+
+          </div>
+        </section>
+        """
+
+        self.send_html(
+            page(
+                "Schlussabrechnung",
+                body,
+                "/energy",
+                notice,
+            )
+        )
+
     def save_advance_change(self, tariff_id, form):
-        try:
-            valid_from = datetime.strptime(str(form.get("valid_month", "")), "%Y-%m").date().replace(day=1).isoformat()
-        except ValueError:
-            valid_from = None
+        valid_from = parse_iso_date(str(form.get("valid_from", "")))
+        valid_from_text = valid_from.isoformat() if hasattr(valid_from, "isoformat") else str(valid_from or "")
+        if valid_from_text and valid_from_text <= date.today().isoformat():
+            raise ValueError("Abschlagsänderungen dürfen nur für zukünftige Zeiträume gespeichert werden.")
         advance = parse_num(form.get("advance_monthly"))
         if not valid_from or advance is None or advance < 0:
             raise ValueError("Bitte Gültigkeitsmonat und einen nichtnegativen Zahlungsbetrag eingeben.")
@@ -2209,11 +5165,10 @@ class Handler(BaseHTTPRequestHandler):
             tariff = db.execute("SELECT * FROM energy_tariffs WHERE id=?", (tariff_id,)).fetchone()
             if not tariff:
                 raise ValueError("Tarif nicht gefunden.")
-            contract_month = tariff["valid_from"][:7]
-            if valid_from[:7] <= contract_month:
-                raise ValueError("Eine spätere Abschlagsänderung muss in einem Monat nach dem Vertragsbeginn liegen. Den ursprünglichen Wert kannst du oben korrigieren.")
-            if tariff["valid_to"] and valid_from[:7] > tariff["valid_to"][:7]:
-                raise ValueError("Der Gültigkeitsmonat liegt nach dem Vertragsende.")
+            if valid_from <= tariff["valid_from"]:
+                raise ValueError("Eine spätere Abschlagsänderung muss nach dem Vertragsbeginn liegen. Den ursprünglichen Wert kannst du oben korrigieren.")
+            if tariff["valid_to"] and valid_from > tariff["valid_to"]:
+                raise ValueError("Das Wirksamkeitsdatum liegt nach dem Vertragsende.")
             db.execute(
                 """INSERT INTO energy_advance_changes(tariff_id,valid_from,advance_monthly)
                    VALUES(?,?,?) ON CONFLICT(tariff_id,valid_from) DO UPDATE SET
@@ -2221,7 +5176,6 @@ class Handler(BaseHTTPRequestHandler):
                 (tariff_id, valid_from, advance),
             )
         self.redirect(f"/energy/tariffs/{tariff_id}/edit?notice=" + urllib.parse.quote("Zahlungsänderung wurde historisch gespeichert."))
-
     def delete_advance_change(self, tariff_id, change_id):
         with connect() as db:
             db.execute("DELETE FROM energy_advance_changes WHERE id=? AND tariff_id=?", (change_id, tariff_id))
@@ -2243,6 +5197,9 @@ class Handler(BaseHTTPRequestHandler):
             ).fetchone()
             if overlap:
                 raise ValueError("Für diesen Zeitraum besteht bereits ein anderer Tarif.")
+            validate_tariff_timeline_neighbors(
+                db, values["metric"], values["valid_from"], values["valid_to"], tariff_id
+            )
             invalid_change = db.execute(
                 """SELECT 1 FROM energy_advance_changes
                    WHERE tariff_id=? AND (valid_from<=? OR valid_from>?) LIMIT 1""",
@@ -2431,6 +5388,617 @@ class Handler(BaseHTTPRequestHandler):
             db.execute("DELETE FROM vehicle_expenses WHERE id=?", (expense_id,))
         self.redirect("/vehicle-costs?notice=" + urllib.parse.quote("Fahrzeugkosten wurden gelöscht."))
 
+    def contract_history_page(self):
+        parsed = urllib.parse.urlparse(self.path)
+        query = urllib.parse.parse_qs(parsed.query)
+
+        notice = str(query.get("notice", [""])[0])
+        metric_filter = str(query.get("type", ["all"])[0])
+        year_filter = str(query.get("year", ["all"])[0])
+
+        metric_items = (
+            ("all", "Alle", "🗂"),
+            ("grid_import", "Strom", "⚡"),
+            ("gas", "Gas", "🔥"),
+            ("water", "Wasser", "💧"),
+            ("wastewater", "Abwasser", "🚰"),
+        )
+
+        allowed_metrics = {
+            item[0]
+            for item in metric_items
+        }
+
+        if metric_filter not in allowed_metrics:
+            metric_filter = "all"
+
+        with connect() as db:
+            rows = db.execute(
+                """
+                SELECT
+                    t.id AS tariff_id,
+                    t.metric,
+                    t.provider,
+                    t.valid_from,
+                    t.valid_to,
+
+                    s.id AS snapshot_id,
+                    s.revision AS snapshot_revision,
+                    s.period_from AS snapshot_period_from,
+                    s.period_to AS snapshot_period_to,
+                    s.title AS snapshot_title,
+                    s.payload_json,
+                    s.created_at AS snapshot_created_at
+
+                FROM energy_tariffs t
+
+                LEFT JOIN energy_settlement_snapshots s
+                  ON s.id = (
+                      SELECT s2.id
+                      FROM energy_settlement_snapshots s2
+                      WHERE s2.tariff_id=t.id
+                      ORDER BY
+                          s2.period_to DESC,
+                          s2.revision DESC,
+                          s2.id DESC
+                      LIMIT 1
+                  )
+
+                WHERE t.valid_to IS NOT NULL
+                  AND t.valid_to <= ?
+
+                ORDER BY
+                    t.valid_to DESC,
+                    t.valid_from DESC,
+                    t.id DESC
+                """,
+                (date.today().isoformat(),),
+            ).fetchall()
+
+        entries = []
+        years = set()
+
+        for row in rows:
+            item = dict(row)
+            payload = {}
+
+            if item["payload_json"]:
+                try:
+                    payload = json.loads(
+                        item["payload_json"]
+                    )
+                except Exception:
+                    payload = {}
+
+            contract = (
+                payload.get("contract")
+                or {}
+            )
+
+            supplier = (
+                payload.get("supplierInvoice")
+                or {}
+            )
+
+            settlement = (
+                payload.get("settlement")
+                or {}
+            )
+
+            metric = (
+                contract.get("metric")
+                or item["metric"]
+            )
+
+            provider = (
+                contract.get("provider")
+                or item["provider"]
+                or "Unbekannter Anbieter"
+            )
+
+            period_from = (
+                item["snapshot_period_from"]
+                or contract.get("validFrom")
+                or item["valid_from"]
+            )
+
+            period_to = (
+                item["snapshot_period_to"]
+                or contract.get("validTo")
+                or item["valid_to"]
+            )
+
+            archive_year = str(
+                period_to or ""
+            )[:4]
+
+            if archive_year:
+                years.add(archive_year)
+
+            consumption = (
+                supplier.get("consumption")
+                or payload.get(
+                    "calculatedBillingConsumption"
+                )
+                or payload.get("consumption")
+                or {}
+            )
+
+            gas_meter = (
+                supplier.get("meterConsumption")
+                or {}
+            )
+
+            total_cost = supplier.get(
+                "totalCost"
+            )
+
+            if total_cost is None:
+                total_cost = settlement.get(
+                    "totalCost"
+                )
+
+            paid_advances = supplier.get(
+                "paidAdvances"
+            )
+
+            if paid_advances is None:
+                paid_advances = settlement.get(
+                    "plannedPayments"
+                )
+
+            balance = supplier.get(
+                "balance"
+            )
+
+            if balance is None:
+                balance = settlement.get(
+                    "balance"
+                )
+
+            entries.append({
+                **item,
+                "metric": metric,
+                "provider_display": provider,
+                "period_from": period_from,
+                "period_to": period_to,
+                "year": archive_year,
+                "supplier": supplier,
+                "consumption": consumption,
+                "gas_meter": gas_meter,
+                "total_cost": total_cost,
+                "paid_advances": paid_advances,
+                "balance": balance,
+            })
+
+        years = sorted(
+            years,
+            reverse=True,
+        )
+
+        if (
+            year_filter != "all"
+            and year_filter not in years
+        ):
+            year_filter = "all"
+
+        def history_url(
+            metric_value=None,
+            year_value=None,
+        ):
+            metric_value = (
+                metric_filter
+                if metric_value is None
+                else metric_value
+            )
+
+            year_value = (
+                year_filter
+                if year_value is None
+                else year_value
+            )
+
+            params = []
+
+            if metric_value != "all":
+                params.append(
+                    "type="
+                    + urllib.parse.quote(
+                        metric_value
+                    )
+                )
+
+            if year_value != "all":
+                params.append(
+                    "year="
+                    + urllib.parse.quote(
+                        year_value
+                    )
+                )
+
+            return (
+                "/contract-history"
+                + (
+                    "?" + "&".join(params)
+                    if params
+                    else ""
+                )
+            )
+
+        metric_tabs = ""
+
+        for key, label, icon in metric_items:
+            active_class = (
+                "btn"
+                if key == metric_filter
+                else "btn secondary"
+            )
+
+            metric_tabs += (
+                f'<a class="{active_class}" '
+                f'href="{history_url(metric_value=key)}">'
+                f'{icon} {esc(label)}</a>'
+            )
+
+        year_tabs = (
+            f'<a class="'
+            f'{"btn" if year_filter == "all" else "btn secondary"}'
+            f'" href="{history_url(year_value="all")}">'
+            f'Alle Jahre</a>'
+        )
+
+        for year in years:
+            active_class = (
+                "btn"
+                if year == year_filter
+                else "btn secondary"
+            )
+
+            year_tabs += (
+                f'<a class="{active_class}" '
+                f'href="{history_url(year_value=year)}">'
+                f'{esc(year)}</a>'
+            )
+
+        visible = []
+
+        for entry in entries:
+            if (
+                metric_filter != "all"
+                and entry["metric"]
+                != metric_filter
+            ):
+                continue
+
+            if (
+                year_filter != "all"
+                and entry["year"]
+                != year_filter
+            ):
+                continue
+
+            visible.append(entry)
+
+        grouped = {}
+
+        for entry in visible:
+            grouped.setdefault(
+                entry["year"] or "Ohne Jahr",
+                [],
+            ).append(entry)
+
+        label_by_metric = {
+            "grid_import": "Strom",
+            "gas": "Gas",
+            "water": "Wasser",
+            "wastewater": "Abwasser",
+        }
+
+        icon_by_metric = {
+            "grid_import": "⚡",
+            "gas": "🔥",
+            "water": "💧",
+            "wastewater": "🚰",
+        }
+
+        def balance_text(value):
+            if value is None:
+                return "–"
+
+            value = float(value)
+
+            if value > 0.004:
+                return (
+                    "Erstattung "
+                    + fmt_money(value)
+                )
+
+            if value < -0.004:
+                return (
+                    "Nachzahlung "
+                    + fmt_money(abs(value))
+                )
+
+            return "ausgeglichen"
+
+        def money_or_dash(value):
+            if value is None:
+                return "–"
+
+            return fmt_money(value)
+
+        sections = ""
+
+        for year in sorted(
+            grouped,
+            reverse=True,
+        ):
+            cards = ""
+
+            for entry in grouped[year]:
+                metric = entry["metric"]
+
+                label = label_by_metric.get(
+                    metric,
+                    metric,
+                )
+
+                icon = icon_by_metric.get(
+                    metric,
+                    "⚡",
+                )
+
+                snapshot_id = entry[
+                    "snapshot_id"
+                ]
+
+                if snapshot_id:
+                    status = (
+                        '<span class="badge ok">'
+                        f'Revision '
+                        f'{entry["snapshot_revision"]} '
+                        '· fixiert'
+                        '</span>'
+                    )
+                else:
+                    status = (
+                        '<span class="badge warn">'
+                        'noch nicht abgerechnet'
+                        '</span>'
+                    )
+
+                invoice_date = (
+                    entry["supplier"].get(
+                        "invoiceDate"
+                    )
+                )
+
+                invoice_row = ""
+
+                if invoice_date:
+                    invoice_row = (
+                        '<div class="row muted">'
+                        '<span>Rechnungsdatum</span>'
+                        f'<span>{esc(invoice_date)}</span>'
+                        '</div>'
+                    )
+
+                consumption = entry[
+                    "consumption"
+                ]
+
+                consumption_row = ""
+
+                if (
+                    consumption.get("amount")
+                    is not None
+                ):
+                    consumption_row = (
+                        '<div class="row">'
+                        '<span>Verbrauch</span>'
+                        '<strong>'
+                        f'{fmt_num(consumption.get("amount"), 2)} '
+                        f'{esc(consumption.get("unit") or "")}'
+                        '</strong>'
+                        '</div>'
+                    )
+
+                gas_row = ""
+
+                if (
+                    metric == "gas"
+                    and entry["gas_meter"].get(
+                        "amount"
+                    ) is not None
+                ):
+                    gas_row = (
+                        '<div class="row muted">'
+                        '<span>Gasmenge</span>'
+                        f'<span>'
+                        f'{fmt_num(entry["gas_meter"]["amount"], 2)} '
+                        'm³'
+                        '</span>'
+                        '</div>'
+                    )
+
+                if snapshot_id:
+                    financial_rows = (
+                        consumption_row
+                        + gas_row
+                        + invoice_row
+                        + '<div class="row muted">'
+                          '<span>Rechnungsbetrag</span>'
+                          f'<span>'
+                          f'{money_or_dash(entry["total_cost"])}'
+                          '</span>'
+                          '</div>'
+                        + '<div class="row muted">'
+                          '<span>berücksichtigte Abschläge</span>'
+                          f'<span>'
+                          f'{money_or_dash(entry["paid_advances"])}'
+                          '</span>'
+                          '</div>'
+                        + '<div class="row">'
+                          '<span>Endsaldo</span>'
+                          f'<strong>'
+                          f'{balance_text(entry["balance"])}'
+                          '</strong>'
+                          '</div>'
+                    )
+                else:
+                    financial_rows = (
+                        '<div class="muted">'
+                        'Für diesen beendeten Vertrag ist '
+                        'noch keine fixierte Schlussabrechnung '
+                        'vorhanden.'
+                        '</div>'
+                    )
+
+                actions = (
+                    '<div class="actions" '
+                    'style="margin-top:18px">'
+                )
+
+                if snapshot_id:
+                    actions += (
+                        '<a class="btn" '
+                        f'href="/settlements/{snapshot_id}">'
+                        'Schlussabrechnung öffnen'
+                        '</a>'
+                    )
+
+                actions += (
+                    '<a class="btn secondary" '
+                    f'href="/energy/tariffs/'
+                    f'{entry["tariff_id"]}/edit">'
+                    'Vertrag öffnen'
+                    '</a>'
+                    '</div>'
+                )
+
+                cards += f"""
+                <div class="card settlement-card">
+
+                  <div class="section-head">
+                    <div>
+                      <h2>
+                        {icon}
+                        {esc(entry["provider_display"])}
+                      </h2>
+
+                      <div class="muted">
+                        {esc(label)}
+                        ·
+                        {esc(entry["period_from"] or "")}
+                        bis
+                        {esc(entry["period_to"] or "")}
+                      </div>
+                    </div>
+
+                    {status}
+                  </div>
+
+                  <div class="settlement-block">
+                    {financial_rows}
+                  </div>
+
+                  {actions}
+                </div>
+                """
+
+            sections += f"""
+            <section class="section">
+
+              <div class="section-head">
+                <div>
+                  <h2>{esc(year)}</h2>
+                  <div class="muted">
+                    Abgeschlossene Energieverträge
+                  </div>
+                </div>
+
+                <span class="badge">
+                  {len(grouped[year])}
+                  {
+                    "Vertrag"
+                    if len(grouped[year]) == 1
+                    else "Verträge"
+                  }
+                </span>
+              </div>
+
+              <div class="settlement-grid">
+                {cards}
+              </div>
+
+            </section>
+            """
+
+        if not sections:
+            sections = """
+            <section class="section card empty">
+              Für diese Auswahl wurden keine abgeschlossenen
+              Verträge gefunden.
+            </section>
+            """
+
+        body = f"""
+        <div class="topbar">
+          <div>
+            <h1>Vertragshistorie</h1>
+
+            <div class="subtitle">
+              Abgeschlossene Verträge und fixierte
+              Schlussabrechnungen
+            </div>
+          </div>
+        </div>
+
+        <section class="card">
+
+          <div class="section-head">
+            <div>
+              <h2>Energieart</h2>
+              <div class="muted">
+                Verträge nach Bereich filtern
+              </div>
+            </div>
+          </div>
+
+          <div class="actions">
+            {metric_tabs}
+          </div>
+
+          <div class="section-head"
+               style="margin-top:22px">
+            <div>
+              <h2>Jahr</h2>
+              <div class="muted">
+                Zuordnung nach Vertrags- bzw.
+                Abrechnungsende
+              </div>
+            </div>
+          </div>
+
+          <div class="actions">
+            {year_tabs}
+          </div>
+
+        </section>
+
+        {sections}
+        """
+
+        self.send_html(
+            page(
+                "Vertragshistorie",
+                body,
+                "/contract-history",
+                notice,
+            )
+        )
+
+
     def import_page(self, notice):
         token = self.cookie_token()
         with connect() as db:
@@ -2446,7 +6014,7 @@ class Handler(BaseHTTPRequestHandler):
                     first_fluids = fluids
         fluid_options = "".join(f'<option>{esc(f)}</option>' for f in first_fluids)
         body = f"""<div class="topbar"><div><h1>Spritmonitor importieren</h1><div class="subtitle">Die Datei wird zuerst geprüft und noch nicht sofort gespeichert</div></div></div><div class="card"><form method="post" action="/import/preview" enctype="multipart/form-data"><input type="hidden" name="csrf" value="{csrf_for(token)}"><div class="form-grid"><div class="field"><label>Fahrzeug</label><select id="vehicle" name="vehicle_id">{options}</select></div><div class="field"><label>Betriebsstoff der CSV</label><select id="fluid" name="fluid">{fluid_options}</select></div><div class="field full"><label>Spritmonitor-CSV</label><input type="file" name="csv_file" accept=".csv,text/csv" required></div></div><button class="btn" style="margin-top:18px">Datei prüfen</button></form></div><section class="section card"><h2>Was wird erkannt?</h2><p class="muted">Datum, Kilometerstand, Menge, Voll-/Teiltankung, Tankstelle und Kosten. Unplausible Cent- oder Literpreiswerte werden in der Vorschau gekennzeichnet und normalisiert. Bereits importierte Zeilen werden nicht doppelt angelegt.</p></section><script>const fluids={json.dumps(fluid_map,ensure_ascii=False)};const v=document.getElementById('vehicle'),f=document.getElementById('fluid');v.addEventListener('change',()=>{{f.innerHTML=(fluids[v.value]||[]).map(x=>`<option>${{x}}</option>`).join('')}});</script>"""
-        self.send_html(page("Import", body, "/import", notice))
+        self.send_html(page("Import", body, "/settings", notice))
 
     def import_preview(self, form):
         vehicle_id = int(form.get("vehicle_id", 0))
@@ -2464,7 +6032,7 @@ class Handler(BaseHTTPRequestHandler):
         table = "".join(f"<tr><td>{esc(datetime.strptime(r['fueled_on'],'%Y-%m-%d').strftime('%d.%m.%Y'))}</td><td>{fmt_num(r['odometer'],0)} km</td><td>{fmt_num(r['liters'])} l</td><td>{fmt_num(r['unit_price'],3)} €/l</td><td>{fmt_money(r['total_price'])}</td><td>{esc(FILL_TYPES[r['fill_type']])}</td><td>{f'<span class=\"badge warn\">{esc(r["warning"])}</span>' if r['warning'] else '<span class="badge ok">OK</span>'}</td></tr>" for r in rows)
         token = self.cookie_token()
         body = f"""<div class="topbar"><div><h1>Importvorschau</h1><div class="subtitle">{len(rows)} Tankungen für {esc(vehicle['name'])} · {warnings} Korrekturhinweise</div></div></div><div class="notice {'warn' if warnings else ''}">{'Bitte die markierten Kosten besonders prüfen. Die angezeigten Werte werden importiert.' if warnings else 'Alle Zeilen sehen plausibel aus.'}</div><div class="card table-wrap"><table><thead><tr><th>Datum</th><th>Km-Stand</th><th>Menge</th><th>Literpreis</th><th>Gesamt</th><th>Art</th><th>Prüfung</th></tr></thead><tbody>{table}</tbody></table></div><form method="post" action="/import/commit" style="margin-top:18px"><input type="hidden" name="csrf" value="{csrf_for(token)}"><input type="hidden" name="payload" value="{esc(payload)}"><div class="actions"><button class="btn">{len(rows)} Tankungen importieren</button><a class="btn secondary" href="/import">Abbrechen</a></div></form>"""
-        self.send_html(page("Importvorschau", body, "/import"))
+        self.send_html(page("Importvorschau", body, "/settings"))
 
     def import_commit(self, form):
         data = verify_blob(str(form.get("payload", "")))
@@ -2530,8 +6098,79 @@ class Handler(BaseHTTPRequestHandler):
         self.send_html(page("Vergleich", body, "/compare"))
 
     def settings_page(self, notice):
-        body = f"""<div class="topbar"><div><h1>Einstellungen</h1><div class="subtitle">Datenexport und automatischer Import</div></div></div><div class="grid"><div class="card"><h2>Excel-Export</h2><p class="muted">Enthält Übersicht, Messwerte und Tarife. In der Übersicht werden Verbrauchskosten, Grundpreis, Gesamtkosten, Abschläge und Guthaben/Nachzahlung getrennt ausgegeben.</p><a class="btn" href="/export/energylab.xlsx">XLSX herunterladen</a></div><div class="card"><h2>Automatischer Import</h2><p>Nächster täglicher Lauf: <strong>{SYNC_HOUR:02d}:{SYNC_MINUTE:02d} Uhr</strong></p><p class="muted">Der Zeitpunkt lässt sich im Portainer-Stack über ENERGYLAB_SYNC_HOUR und ENERGYLAB_SYNC_MINUTE ändern.</p></div></div>"""
-        self.send_html(page("Einstellungen", body, "/settings", notice))
+        token = self.cookie_token()
+        hour, minute = sync_time()
+        config = finanzlab_config()
+        integration = finanzlab_sync_status()
+        status_class = "ok" if integration["status"] == "ok" else "warn"
+        status_label = {
+            "ok": "Verbunden",
+            "warning": "Hinweis",
+            "error": "Fehler",
+            "never": "Noch nie",
+        }.get(integration["status"], integration["status"])
+        status_text = (
+            f"{integration['importedCount']} Zahlungen übernommen · "
+            f"{integration['unresolvedCount']} noch zu prüfen"
+            if integration["lastSyncAt"] else "Noch kein Zahlungsabgleich"
+        )
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        backups = sorted(BACKUP_DIR.glob("energylab-*.sqlite3"), key=lambda item: item.stat().st_mtime, reverse=True)
+        backup_rows = "".join(
+            f"""<tr><td>{esc(item.name)}</td><td>{datetime.fromtimestamp(item.stat().st_mtime).strftime('%d.%m.%Y %H:%M')}</td><td>{item.stat().st_size/1048576:.1f} MB</td><td><div class="actions"><a href="/settings/backups/{urllib.parse.quote(item.name)}/download">Herunterladen</a><form method="post" action="/settings/backups/{urllib.parse.quote(item.name)}/restore"><input type="hidden" name="csrf" value="{csrf_for(token)}"><button class="btn secondary" onclick="return confirm('Diese Sicherung wiederherstellen? Der aktuelle Stand wird vorher gesichert.')">Wiederherstellen</button></form></div></td></tr>"""
+            for item in backups
+        )
+        body = f"""
+        <div class="topbar"><div><h1>Einstellungen</h1><div class="subtitle">Import, Verbindung und Datensicherheit übersichtlich an einem Ort</div></div></div>
+        <div class="grid settings-grid">
+          <div class="card"><h2>Automatischer Import</h2><p class="muted">EnergyLab prüft Home Assistant und – falls eingerichtet – FinanzLab täglich zur gewählten Uhrzeit.</p><form method="post" action="/settings/sync-time"><input type="hidden" name="csrf" value="{csrf_for(token)}"><div class="field"><label>Tägliche Importzeit</label><input type="time" name="sync_time" value="{hour:02d}:{minute:02d}" required></div><button class="btn" style="margin-top:16px">Uhrzeit speichern</button></form><form method="post" action="/settings/import-now" style="margin-top:14px"><input type="hidden" name="csrf" value="{csrf_for(token)}"><button class="btn secondary">Jetzt importieren</button></form><p class="muted">„Jetzt importieren“ übernimmt alle aktuell verfügbaren Messwerte und bestätigten Zahlungen.</p></div>
+          <div class="card"><div class="section-head"><div><h2>FinanzLab-Zahlungen</h2><div class="muted">Optionaler Zahlungsabgleich; für Schlussabrechnungen nicht erforderlich</div></div><span class="badge {status_class}">{esc(status_label)}</span></div><form method="post" action="/settings/finanzlab"><input type="hidden" name="csrf" value="{csrf_for(token)}"><div class="field"><label>FinanzLab-Adresse</label><input type="url" name="finanzlab_base_url" value="{esc(config['financeLabBaseUrl'])}" placeholder="http://finanzlab:8798"></div><div class="field"><label>FinanzLab-Haushalt <span class="muted">(Name oder interne ID)</span></label><input name="finanzlab_household_id" value="{esc(config['householdId'])}" placeholder="z. B. Zuhause"></div><div class="field"><label>Zugriffsschlüssel <span class="muted">(optional)</span></label><input type="password" name="finanzlab_access_token" value="{esc(config['accessToken'])}" autocomplete="new-password"></div><button class="btn" style="margin-top:16px">Verbindung speichern</button></form><form method="post" action="/settings/finanzlab-sync" style="margin-top:14px"><input type="hidden" name="csrf" value="{csrf_for(token)}"><button class="btn secondary" {'disabled' if not integration['configured'] else ''}>Zahlungen jetzt abgleichen</button></form><p class="muted">{esc(status_text)}{(' · zuletzt '+esc(integration['lastSyncAt'])) if integration['lastSyncAt'] else ''}</p></div>
+          <div class="card"><h2>Excel-Export</h2><p class="muted">Enthält Übersicht, Messwerte, Tarife, Abschlagsverlauf sowie die für Abrechnungen verwendeten Werte.</p><a class="btn" href="/export/energylab.xlsx">XLSX herunterladen</a></div>
+          <div class="card"><div class="section-head"><div><h2>Datenbanksicherungen</h2><div class="muted">Automatisch vor Updates und Wiederherstellungen</div></div><form method="post" action="/settings/backups/create"><input type="hidden" name="csrf" value="{csrf_for(token)}"><button class="btn secondary">Jetzt sichern</button></form></div><div class="table-wrap"><table><thead><tr><th>Datei</th><th>Erstellt</th><th>Größe</th><th></th></tr></thead><tbody>{backup_rows or '<tr><td colspan="4" class="empty">Noch keine lokale Sicherung.</td></tr>'}</tbody></table></div></div>
+          <div class="card">
+            <div class="section-head">
+              <div>
+                <h2>⇩ Spritmonitor-Import</h2>
+                <div class="muted">
+                  Tankungen aus einer Spritmonitor-CSV
+                  prüfen und übernehmen.
+                </div>
+              </div>
+              <span class="badge">Import</span>
+            </div>
+
+            <div class="actions">
+              <a class="btn secondary"
+                 href="/import">
+                CSV-Import öffnen
+              </a>
+            </div>
+          </div>
+        </div>"""
+        self.send_html(page("Einstellungen", body, "/settings", notice, "Fehler" in notice))
+
+    def save_finanzlab_settings(self, form):
+        base_url = str(form.get("finanzlab_base_url", "")).strip().rstrip("/")
+        household_id = str(form.get("finanzlab_household_id", "")).strip()
+        access_token = str(form.get("finanzlab_access_token", "")).strip()
+        if base_url and not base_url.startswith(("http://", "https://")):
+            raise ValueError("Bitte eine gültige FinanzLab-Adresse eingeben.")
+        if bool(base_url) != bool(household_id):
+            raise ValueError("FinanzLab-Adresse und Haushalts-ID müssen gemeinsam angegeben werden.")
+        with connect() as db:
+            set_meta("finanzlab_base_url", base_url, db)
+            set_meta("finanzlab_household_id", household_id, db)
+            set_meta("finanzlab_access_token", access_token, db)
+        self.redirect("/settings?notice=" + urllib.parse.quote("FinanzLab-Verbindung wurde gespeichert."))
+
+    def download_database_backup(self, filename):
+        target = (BACKUP_DIR / Path(str(filename)).name).resolve()
+        if target.parent != BACKUP_DIR.resolve() or not target.is_file() or not target.name.startswith("energylab-"):
+            self.send_html(page("Nicht gefunden", '<div class="notice warn">Sicherung nicht gefunden.</div>'), 404)
+            return
+        self.send_bytes(target.read_bytes(), "application/vnd.sqlite3", headers={
+            "Content-Disposition": f'attachment; filename="{target.name}"'
+        })
 
     def export_xlsx(self):
         with connect() as db:

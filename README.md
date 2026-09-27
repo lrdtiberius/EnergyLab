@@ -2,9 +2,9 @@
 
 EnergyLab ist ein schlankes, lokal betriebenes Dashboard für Energie-, Wasser-, Abwasser- und Fahrzeugdaten. Die Anwendung läuft als einzelner Docker-Container, speichert ihre Daten in SQLite und kann Zählerstände aus Home Assistant übernehmen.
 
-## Release 0.6.6
+## Release 1.2.2
 
-EnergyLab 0.6.6 erweitert die Verbrauchs- und Vertragsverwaltung:
+EnergyLab 1.2.2 entspricht dem auf dem AM06 geprüften Stand vom 24. September 2026. Gegenüber dem bisher veröffentlichten Stand kamen insbesondere hinzu:
 
 - eigene Bereiche für Strom, Gas, Wasser und Abwasser
 - Abwasserverbrauch automatisch aus dem Wasserzähler, aber mit eigenem Tarif und eigenen Zahlungen
@@ -13,9 +13,15 @@ EnergyLab 0.6.6 erweitert die Verbrauchs- und Vertragsverwaltung:
 - Kontoübergabe und Zahlungstermine für die automatische Übernahme durch FinanzLab
 - manuelle, auch rückwirkende Zählerstände für Strom, Gas und Wasser
 - Verbrauchsdifferenz im Zeitraumvergleich und vollständiger Zählerstände-Export
-- Grundpreis und Zahlungsbetrag in Monatsansichten als volle Monatswerte
+- Grundpreise werden bei Teilmonaten zeitanteilig angesetzt; Zahlungsbeträge folgen ihrem tatsächlichen Fälligkeitstakt
+- revisionssichere Ist-Zahlungen, Rückerstattungen, Rücklastschriften, Korrekturen und Zahlungspausen
+- Schlussabrechnungs-Snapshots und Zahlungsabgleich mit FinanzLab
+- integrierte, herunterladbare Datenbanksicherungen mit automatischer Sicherung vor Updates und Wiederherstellungen
+- Spritmonitor-CSV-Import mit Vorschau, Plausibilitätsprüfung und Dublettenschutz
+- zusätzliche Fahrzeugkosten sowie kombinierte Kosten je Kilometer
+- installierbare Web-App-Symbole und Manifest
 
-Die Version 0.6.6 ist ein vollständiges Standalone-Release und benötigt keinen Patch sowie keine ältere Programmversion. Beim Update bleibt das vorhandene Docker-Volume erhalten.
+Die Version 1.2.2 ist ein vollständiges Standalone-Release und benötigt keinen Patch sowie keine ältere Programmversion. Beim Update bleibt das vorhandene Docker-Volume erhalten; vor einer Datenbankmigration legt EnergyLab automatisch eine Sicherung an.
 
 ## Installation und Einrichtung
 
@@ -37,6 +43,9 @@ Die vollständige Schritt-für-Schritt-Anleitung für Portainer, Docker Compose,
 - Zeitraums- und Vorjahresvergleich einschließlich Verbrauchsdifferenz
 - Excel-Export einschließlich aller automatischen und manuellen Zählerstände
 - Fahrzeug-, Tank- und Betriebskostenverwaltung
+- Spritmonitor-Import mit Prüf- und Bestätigungsschritt
+- manuelle und automatische Datenbanksicherungen unter `/data/backups`
+- optionaler Abgleich bestätigter Zahlungen mit FinanzLab
 
 ## Start mit Docker Compose
 
@@ -61,6 +70,13 @@ Die mitgelieferte `docker-compose.yml` enthält ausschließlich neutrale Platzha
 | `ENERGYLAB_SYNC_HOUR` | Stunde der täglichen Synchronisierung | `23` |
 | `ENERGYLAB_SYNC_MINUTE` | Minute der täglichen Synchronisierung | `30` |
 | `BUY_ME_A_COFFEE_URL` | Ziel des Unterstützungslinks | siehe Beispiel-Stack |
+| `FINANZLAB_BASE_URL` | optionale FinanzLab-Adresse für den Zahlungsabgleich | leer |
+| `FINANZLAB_HOUSEHOLD_ID` | Haushalt als Name oder interne ID | leer |
+| `FINANZLAB_TOKEN` | optionaler Zugriffsschlüssel | leer |
+
+## Dokumentation
+
+Das ausführliche Benutzerhandbuch steht in [HANDBUCH.md](HANDBUCH.md). Versionsänderungen sind im [CHANGELOG.md](CHANGELOG.md) dokumentiert.
 
 ## Update
 
@@ -69,6 +85,10 @@ Baue das neue Image, ändere im Portainer-Stack den Image-Namen und aktualisiere
 ## Datenschutz
 
 Das Repository enthält keine privaten Home-Assistant-Adressen, Tokens, Sensor-IDs, Zählerstände, Verbrauchsdaten, Tarife oder Vertragsdaten. Alle Nutzdaten bleiben in der lokalen SQLite-Datenbank.
+
+## Bekannte Einschränkungen
+
+Fünf ältere Regressionstests bilden noch das frühere Verhalten von Monatsnavigation, Abrechnungshochrechnung und vollständigen Grundpreisen in Teilmonaten ab. Sie sind als erwartete Abweichungen markiert, bis die Tests fachlich auf das aktuelle 1.2.2-Modell umgestellt sind.
 
 ## Urheber und Unterstützung
 

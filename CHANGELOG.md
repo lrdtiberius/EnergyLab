@@ -1,5 +1,17 @@
 # Änderungsverlauf
 
+## 1.2.2 – geprüfter Produktionsstand
+
+- Anwendungscode auf den am 24. September 2026 gebauten und auf dem AM06 laufenden Stand synchronisiert
+- Ist-Zahlungen, Rückerstattungen, Rücklastschriften, Korrekturen und Zahlungspausen revisionssicher ergänzt
+- Schlussabrechnungen können als unveränderliche Snapshots festgehalten werden
+- optionaler Zahlungsabgleich mit FinanzLab einschließlich Zugriffsschlüssel und manuellem Sofortabgleich
+- automatische Sicherung vor Versionsmigrationen sowie manuelle, herunterladbare und geprüfte Wiederherstellung von Datenbanksicherungen
+- Spritmonitor-CSV-Import mit Vorschau, Normalisierung auffälliger Werte und Dublettenschutz
+- zusätzliche Fahrzeugkosten und gemeinsame Kosten-pro-Kilometer-Auswertung
+- Web-App-Manifest und Symbole in das Standalone-Image aufgenommen
+- Basisimage auf Python 3.13.15 `slim-trixie` vereinheitlicht
+
 ## 0.6.6 – Verträge, Zahlungen und Abwasser
 
 ### Neu

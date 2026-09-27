@@ -1,6 +1,6 @@
 services:
   energylab:
-    image: ghcr.io/lrdtiberius/energylab:latest
+    image: energylab:1.2.2
     container_name: energylab
     restart: unless-stopped
     ports:
@@ -12,6 +12,9 @@ services:
       HA_GRID_IMPORT_ENTITY: ""
       HA_PV_SELF_ENTITY: ""
       HA_GAS_ENTITY: ""
+      FINANZLAB_BASE_URL: ""
+      FINANZLAB_HOUSEHOLD_ID: ""
+      FINANZLAB_TOKEN: ""
       ENERGYLAB_SYNC_HOUR: "23"
       ENERGYLAB_SYNC_MINUTE: "30"
       BUY_ME_A_COFFEE_URL: "https://www.paypal.com/paypalme/SebastianM207"

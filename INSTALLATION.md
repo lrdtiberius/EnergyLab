@@ -1,6 +1,6 @@
-# EnergyLab 0.6.6 installieren und einrichten
+# EnergyLab 1.2.2 installieren und einrichten
 
-Diese Anleitung beschreibt die vollständige Erstinstallation und das Update einer bestehenden EnergyLab-Installation. Version 0.6.6 ist ein Standalone-Release und benötigt keinen Patch und keine frühere Programmversion.
+Diese Anleitung beschreibt die vollständige Erstinstallation und das Update einer bestehenden EnergyLab-Installation. Version 1.2.2 ist ein Standalone-Release und benötigt keinen Patch und keine frühere Programmversion.
 
 ## 1. Voraussetzungen
 
@@ -16,13 +16,13 @@ EnergyLab besitzt keine Benutzeranmeldung. Verwende es im vertrauenswürdigen He
 
 ### 2.1 Image bauen
 
-1. Lade `energylab-portainer-build-v0.6.6-clean.tar.gz` herunter.
+1. Lade `energylab-portainer-build-v1.2.2.tar.gz` herunter.
 2. Öffne in Portainer **Images**.
 3. Wähle **Build a new image** und anschließend den Upload eines Archivs.
-4. Vergib den Namen `energylab:0.6.6`.
+4. Vergib den Namen `energylab:1.2.2`.
 5. Lade das Archiv hoch und starte den Build.
 
-Das Archiv enthält den vollständigen Stand von EnergyLab 0.6.6 sowie den Docker-Buildkontext. Es ist kein älteres Image erforderlich.
+Das Archiv enthält den vollständigen Stand von EnergyLab 1.2.2 sowie den Docker-Buildkontext. Es ist kein älteres Image erforderlich.
 
 ### 2.2 Stack anlegen
 
@@ -31,7 +31,7 @@ Lege unter **Stacks → Add stack** beispielsweise den Stack `energylab` mit fol
 ```yaml
 services:
   energylab:
-    image: energylab:0.6.6
+    image: energylab:1.2.2
     container_name: energylab
     restart: unless-stopped
     ports:
@@ -217,7 +217,7 @@ Das Volume enthält die SQLite-Datenbank unter `/data/energylab.sqlite3`.
 ## 13. Update einer bestehenden Installation
 
 1. Erstelle zuerst ein JSON-Backup.
-2. Baue das neue Standalone-Archiv unter einem neuen Image-Namen, zum Beispiel `energylab:0.6.6`, oder ziehe `ghcr.io/lrdtiberius/energylab:latest` neu.
+2. Baue das neue Standalone-Archiv unter einem neuen Image-Namen, zum Beispiel `energylab:1.2.2`, oder ziehe `ghcr.io/lrdtiberius/energylab:latest` neu.
 3. Ändere ausschließlich den Image-Namen im Stack.
 4. Aktualisiere den Stack.
 5. Behalte das vorhandene Volume `energylab_data` unverändert bei.

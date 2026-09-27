@@ -8,6 +8,10 @@ data/
 *_fuelings.csv
 *.csv
 *.png
+!apple-touch-icon.png
+!favicon-32x32.png
+!icon-192.png
+!icon-512.png
 *.jpg
 *.jpeg
 *.webp

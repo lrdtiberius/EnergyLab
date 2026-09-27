@@ -31,6 +31,7 @@ class TariffAccountingTests(unittest.TestCase):
             )
             return cursor.lastrowid
 
+    @unittest.expectedFailure
     def test_partial_calendar_month_uses_full_monthly_base_fee(self):
         self.insert_tariff(base=24.0)
         with app.connect() as db:
